@@ -1,0 +1,30 @@
+# Entorno virtual
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+
+# Variables de entorno
+.env
+.env.local
+.env.*.local
+
+# Directorios de datos generados
+uploads/
+exports/
+*.csv
+*.xlsx
+*.xls
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Archivos de log
+*.log
