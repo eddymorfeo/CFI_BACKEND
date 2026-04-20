@@ -1,5 +1,5 @@
 import re
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
 import pdfplumber
@@ -45,8 +45,8 @@ class BancoEstadoCartolaInstantaneaParser(BaseParser):
                     }
                 )
 
-        document_metadata = self._extract_metadata(pages)
         movements = self._extract_movements(pages)
+        document_metadata = self._extract_metadata(pages, movements)
 
         return {
             "parser_code": "BANCO_ESTADO_CARTOLA_INSTANTANEA",
@@ -54,22 +54,148 @@ class BancoEstadoCartolaInstantaneaParser(BaseParser):
             "movements": movements,
         }
 
-    def _extract_metadata(self, pages: list[dict]) -> dict:
-        first_page_text = pages[0]["text"]
+    def _extract_metadata(self, pages: list[dict], movements: list[dict]) -> dict:
+        first_page = pages[0]["page"] if pages else None
+        first_page_text = pages[0]["text"] if pages else ""
 
-        holder_match = re.search(
-            r"Nombre:\s*(.*?)\s+Cuenta:\s*(\d+)\s+Fecha y hora",
-            first_page_text,
-            re.IGNORECASE | re.DOTALL,
-        )
+        holder_name = None
+        account_number = None
+
+        if first_page is not None:
+            header_metadata = self._extract_header_table_metadata(first_page)
+            holder_name = header_metadata.get("holder_name")
+            account_number = header_metadata.get("account_number")
+
+        if not holder_name:
+            holder_name = self._extract_holder_name_from_text(first_page_text)
+
+        if not account_number:
+            account_number = self._extract_account_number_from_text(first_page_text)
+
+        document_date_from, document_date_to = self._extract_date_range_from_movements(movements)
 
         return {
             "detected_institution_name": "BancoEstado",
-            "detected_holder_name": self._clean_text(holder_match.group(1)) if holder_match else None,
-            "detected_account_number": holder_match.group(2) if holder_match else None,
-            "document_date_from": None,
-            "document_date_to": None,
+            "detected_holder_name": holder_name,
+            "detected_account_number": account_number,
+            "document_date_from": document_date_from,
+            "document_date_to": document_date_to,
         }
+
+    def _extract_header_table_metadata(self, first_page) -> dict:
+        words = first_page.extract_words(
+            use_text_flow=False,
+            keep_blank_chars=False,
+            x_tolerance=2,
+            y_tolerance=2,
+        )
+
+        if not words:
+            return {
+                "holder_name": None,
+                "account_number": None,
+            }
+
+        normalized_words = [
+            {
+                "text": self._clean_text(word["text"]),
+                "x0": float(word["x0"]),
+                "x1": float(word["x1"]),
+                "top": float(word["top"]),
+                "bottom": float(word["bottom"]),
+            }
+            for word in words
+        ]
+
+        nombre_label = self._find_word(normalized_words, "Nombre:")
+        cuenta_label = self._find_word(normalized_words, "Cuenta:")
+
+        if nombre_label is None or cuenta_label is None:
+            return {
+                "holder_name": None,
+                "account_number": None,
+            }
+
+        value_top_min = max(nombre_label["bottom"], cuenta_label["bottom"]) - 2
+        value_top_max = value_top_min + 30
+
+        holder_words = [
+            word["text"]
+            for word in normalized_words
+            if value_top_min <= word["top"] <= value_top_max
+            and word["x0"] >= (nombre_label["x0"] - 5)
+            and word["x0"] < (cuenta_label["x0"] - 10)
+        ]
+
+        account_words = [
+            word["text"]
+            for word in normalized_words
+            if value_top_min <= word["top"] <= value_top_max
+            and word["x0"] >= (cuenta_label["x0"] - 5)
+            and word["x0"] <= (cuenta_label["x0"] + 120)
+        ]
+
+        holder_name = self._clean_text(" ".join(holder_words)) or None
+        account_number = None
+
+        if account_words:
+            account_match = re.search(r"\d+", " ".join(account_words))
+            if account_match:
+                account_number = account_match.group(0)
+
+        return {
+            "holder_name": holder_name,
+            "account_number": account_number,
+        }
+
+    def _extract_holder_name_from_text(self, first_page_text: str) -> str | None:
+        text = self._clean_text(first_page_text)
+
+        patterns = [
+            r"Nombre:\s*(.*?)\s+Cuenta:\s*\d+\s+Fecha y hora",
+            r"Nombre:\s*(.*?)\s+Cuenta:\s*",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+            if match:
+                holder_name = self._clean_text(match.group(1))
+                return holder_name or None
+
+        return None
+
+    def _extract_account_number_from_text(self, first_page_text: str) -> str | None:
+        text = self._clean_text(first_page_text)
+
+        patterns = [
+            r"Cuenta:\s*(\d+)\s+Fecha y hora",
+            r"Cuenta:\s*(\d+)",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+            if match:
+                return match.group(1)
+
+        return None
+
+    def _extract_date_range_from_movements(self, movements: list[dict]) -> tuple[date | None, date | None]:
+        movement_dates = [
+            movement.get("transaction_date")
+            for movement in movements
+            if movement.get("transaction_date") is not None
+        ]
+
+        if not movement_dates:
+            return None, None
+
+        return min(movement_dates), max(movement_dates)
+
+    def _find_word(self, words: list[dict], target: str) -> dict | None:
+        for word in words:
+            if word["text"] == target:
+                return word
+        return None
 
     def _extract_movements(self, pages: list[dict]) -> list[dict]:
         movements = []
@@ -78,29 +204,27 @@ class BancoEstadoCartolaInstantaneaParser(BaseParser):
         for page_info in pages:
             page_number = page_info["page_number"]
             text = page_info["text"]
-            
+
             lines = text.split('\n')
             lines = [line.strip() for line in lines if line.strip()]
-            
-            # Encontrar sección de movimientos
+
             movement_lines = []
             in_movements = False
-            
+
             for line in lines:
                 if 'Movimientos' in line:
                     in_movements = True
                     continue
-                
+
                 if in_movements:
                     if 'Saldos' in line or 'SALDOS' in line or 'retenciones' in line:
                         break
                     if 'Página' in line or 'WWW.CMFCHILE.CL' in line.upper() or 'GARANTIA ESTATAL' in line.upper():
                         continue
                     movement_lines.append(line)
-            
-            # Reconstruir movimientos
+
             movements_data = self._group_movement_lines_advanced(movement_lines)
-            
+
             for movement_data in movements_data:
                 movement = self._parse_movement_advanced(movement_data, row_number, page_number)
                 if movement:
@@ -110,21 +234,18 @@ class BancoEstadoCartolaInstantaneaParser(BaseParser):
         return movements
 
     def _group_movement_lines_advanced(self, lines: list[str]) -> list[dict]:
-        """Agrupa líneas detectando el patrón correcto según el diagnóstico."""
         movements = []
         i = 0
-        
+
         while i < len(lines):
             line = lines[i]
-            
-            # Caso: La línea comienza con "STGO." (descripción pura)
+
             if line.startswith('STGO.'):
                 if i + 2 < len(lines):
                     desc_line = line
                     date_line = lines[i + 1]
                     branch_line = lines[i + 2]
-                    
-                    # Verificar que la siguiente línea tiene fecha
+
                     if self.DATE_PATTERN.match(date_line[:10]):
                         movements.append({
                             'type': 'desc_separate',
@@ -134,16 +255,11 @@ class BancoEstadoCartolaInstantaneaParser(BaseParser):
                         })
                         i += 3
                         continue
-            
-            # Caso: La línea comienza con fecha
+
             elif self.DATE_PATTERN.match(line[:10]):
-                # Verificar si la descripción está en la misma línea
-                # Extraer todo después de la fecha y número de operación
                 remaining = line[10:].strip()
-                
-                # Si hay descripción en la misma línea (ej: "COMPRA WEB INTERN. FACEBK ADS")
+
                 if remaining and '$' in remaining:
-                    # La descripción está antes del primer $
                     desc_match = re.search(r'^(.*?)\s*\$', remaining)
                     if desc_match:
                         desc_inline = desc_match.group(1).strip()
@@ -154,8 +270,7 @@ class BancoEstadoCartolaInstantaneaParser(BaseParser):
                         })
                         i += 1
                         continue
-                
-                # Si no hay descripción inline, buscar siguiente línea
+
                 if i + 1 < len(lines):
                     next_line = lines[i + 1]
                     movements.append({
@@ -165,127 +280,108 @@ class BancoEstadoCartolaInstantaneaParser(BaseParser):
                     })
                     i += 2
                     continue
-            
+
             i += 1
-        
+
         return movements
 
     def _parse_movement_advanced(self, movement_data: dict, row_number: int, page_number: int) -> dict | None:
-        """Parsea según el tipo detectado."""
         movement_type = movement_data.get('type')
-        
+
         if movement_type == 'desc_separate':
             return self._parse_desc_separate(movement_data, row_number, page_number)
         elif movement_type == 'two_lines':
             return self._parse_two_lines(movement_data, row_number, page_number)
         elif movement_type == 'inline':
             return self._parse_inline(movement_data, row_number, page_number)
-        
+
         return None
 
     def _parse_desc_separate(self, movement_data: dict, row_number: int, page_number: int) -> dict | None:
-        """Parsea movimiento con descripción separada (3 líneas)."""
         desc_line = movement_data['desc_line']
         date_line = movement_data['date_line']
         branch_line = movement_data['branch_line']
-        
-        # Fecha
+
         fecha = date_line[:10]
-        
-        # Número de operación
+
         doc_match = re.search(r'(\d{6,})', date_line)
         documento = doc_match.group(1) if doc_match else None
-        
-        # Montos
+
         cargo, abono, saldo = self._extract_amounts(date_line)
-        
-        # Descripción: viene en desc_line (ej: "STGO. TEF A JAVIERA FRANCISCA PASTEN")
+
         desc_clean = re.sub(r'STGO\.\s*', '', desc_line, flags=re.IGNORECASE).strip()
-        
-        # Extraer palabra final de branch_line (ej: "NAVA" de "PRINCIPAL NAVA")
+
         last_word = ''
         if branch_line:
             branch_clean = re.sub(r'PRINCIPAL', '', branch_line, flags=re.IGNORECASE).strip()
             words = branch_clean.split()
             if words:
                 last_word = words[-1]
-        
-        # Concatenar descripción + palabra final
+
         if last_word:
             descripcion = f"{desc_clean} {last_word}".strip()
         else:
             descripcion = desc_clean
-        
+
         descripcion = self._clean_description(descripcion)
-        
+
         return self._build_result(fecha, documento, descripcion, cargo, abono, saldo, row_number, page_number)
 
     def _parse_two_lines(self, movement_data: dict, row_number: int, page_number: int) -> dict | None:
-        """Parsea movimiento con 2 líneas (fecha + descripción en línea siguiente)."""
         date_line = movement_data['date_line']
         desc_line = movement_data['desc_line']
-        
-        # Fecha
+
         fecha = date_line[:10]
-        
-        # Número de operación
+
         doc_match = re.search(r'(\d{6,})', date_line)
         documento = doc_match.group(1) if doc_match else None
-        
-        # Montos
+
         cargo, abono, saldo = self._extract_amounts(date_line)
-        
-        # Descripción: viene en desc_line, eliminar "STGO. PRINCIPAL" o "PRINCIPAL"
+
         descripcion = desc_line
         descripcion = re.sub(r'STGO\.\s*PRINCIPAL', '', descripcion, flags=re.IGNORECASE)
         descripcion = re.sub(r'STGO\.', '', descripcion, flags=re.IGNORECASE)
         descripcion = re.sub(r'PRINCIPAL', '', descripcion, flags=re.IGNORECASE)
         descripcion = descripcion.strip()
         descripcion = self._clean_description(descripcion)
-        
+
         return self._build_result(fecha, documento, descripcion, cargo, abono, saldo, row_number, page_number)
 
     def _parse_inline(self, movement_data: dict, row_number: int, page_number: int) -> dict | None:
-        """Parsea movimiento donde la descripción está en la misma línea de fecha."""
         date_line = movement_data['date_line']
         inline_description = movement_data.get('inline_description', '')
-        
-        # Fecha
+
         fecha = date_line[:10]
-        
-        # Número de operación
+
         doc_match = re.search(r'(\d{6,})', date_line)
         documento = doc_match.group(1) if doc_match else None
-        
-        # Montos
+
         cargo, abono, saldo = self._extract_amounts(date_line)
-        
-        # Descripción: usar la inline
+
         descripcion = inline_description
         descripcion = re.sub(r'STGO\.\s*PRINCIPAL', '', descripcion, flags=re.IGNORECASE)
         descripcion = re.sub(r'STGO\.', '', descripcion, flags=re.IGNORECASE)
         descripcion = re.sub(r'PRINCIPAL', '', descripcion, flags=re.IGNORECASE)
         descripcion = descripcion.strip()
         descripcion = self._clean_description(descripcion)
-        
+
         return self._build_result(fecha, documento, descripcion, cargo, abono, saldo, row_number, page_number)
 
     def _extract_amounts(self, date_line: str) -> tuple[Decimal, Decimal, Decimal]:
-        """Extrae cargo, abono y saldo de la línea de fecha."""
         amount_pattern = r'\$\s*(-?\d{1,3}(?:\.\d{3})*|\d+)'
         amounts = re.findall(amount_pattern, date_line)
-        
+
         cargo = Decimal('0')
         abono = Decimal('0')
         saldo = Decimal('0')
-        
+
         for amt in amounts:
             is_negative = amt.startswith('-')
             amt_clean = amt.replace('-', '').replace('.', '')
-            
+
             try:
                 value = Decimal(amt_clean)
-                
+
                 if is_negative:
                     cargo = value
                 else:
@@ -299,29 +395,35 @@ class BancoEstadoCartolaInstantaneaParser(BaseParser):
                             abono = value
                         else:
                             saldo = value
-            except:
+            except InvalidOperation:
                 pass
-        
-        # Caso especial: dos positivos sin negativo
-        if cargo == 0 and len([a for a in amounts if not a.startswith('-')]) == 2:
-            positive_amounts = [a for a in amounts if not a.startswith('-')]
+
+        if cargo == 0 and len([amount for amount in amounts if not amount.startswith('-')]) == 2:
+            positive_amounts = [amount for amount in amounts if not amount.startswith('-')]
             if len(positive_amounts) >= 2:
                 try:
                     abono = Decimal(positive_amounts[0].replace('.', ''))
                     saldo = Decimal(positive_amounts[1].replace('.', ''))
-                except:
+                except InvalidOperation:
                     pass
-        
+
         return cargo, abono, saldo
 
-    def _build_result(self, fecha: str, documento: str, descripcion: str,
-                      cargo: Decimal, abono: Decimal, saldo: Decimal,
-                      row_number: int, page_number: int) -> dict:
-        """Construye el resultado final."""
+    def _build_result(
+        self,
+        fecha: str,
+        documento: str,
+        descripcion: str,
+        cargo: Decimal,
+        abono: Decimal,
+        saldo: Decimal,
+        row_number: int,
+        page_number: int
+    ) -> dict:
         sucursal = 'STGO. PRINCIPAL'
         detected_movement_type = self._detect_movement_type(descripcion)
         is_transfer_candidate = detected_movement_type in {"TRANSFER_IN", "TRANSFER_OUT"}
-        
+
         return {
             "row_number": row_number,
             "page_number": page_number,
@@ -342,10 +444,9 @@ class BancoEstadoCartolaInstantaneaParser(BaseParser):
         }
 
     def _clean_description(self, description: str) -> str:
-        """Limpia la descripción."""
         if not description:
             return ""
-        
+
         garbage = [
             r'\$',
             r'Página\s+de\s+\d+',
@@ -357,12 +458,12 @@ class BancoEstadoCartolaInstantaneaParser(BaseParser):
             r'DEPOSITOS',
             r'w{3}\.',
         ]
-        
+
         for pattern in garbage:
             description = re.sub(pattern, '', description, flags=re.IGNORECASE)
-        
+
         description = re.sub(r'\s+', ' ', description)
-        
+
         return description.strip()
 
     def _detect_movement_type(self, description: str) -> str:
