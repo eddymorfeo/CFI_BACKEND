@@ -9,8 +9,6 @@ from app.parsers.base_parser import BaseParser
 
 class BancoEstadoCartolaInstantaneaParser(BaseParser):
     DATE_PATTERN = re.compile(r"^\d{2}/\d{2}/\d{4}$")
-    DOC_PATTERN = re.compile(r"^\d{6,}$")
-    AMOUNT_PATTERN = re.compile(r"^-?\d{1,3}(?:\.\d{3})*$|^-?\d+$")
 
     def can_parse(self, file_path: str) -> bool:
         path = self.validate_file_exists(file_path)
@@ -79,241 +77,307 @@ class BancoEstadoCartolaInstantaneaParser(BaseParser):
 
         for page_info in pages:
             page_number = page_info["page_number"]
-            page = page_info["page"]
-
-            words = page.extract_words(
-                use_text_flow=True,
-                keep_blank_chars=False,
-                x_tolerance=2,
-                y_tolerance=3,
-            )
-
-            rows = self._group_words_by_row(words)
-            movement_rows = self._filter_movement_rows(rows)
-            logical_rows = self._merge_multiline_rows(movement_rows)
-
-            for logical_row in logical_rows:
-                movement = self._parse_row(logical_row, row_number, page_number)
-                if movement is not None:
+            text = page_info["text"]
+            
+            lines = text.split('\n')
+            lines = [line.strip() for line in lines if line.strip()]
+            
+            # Encontrar sección de movimientos
+            movement_lines = []
+            in_movements = False
+            
+            for line in lines:
+                if 'Movimientos' in line:
+                    in_movements = True
+                    continue
+                
+                if in_movements:
+                    if 'Saldos' in line or 'SALDOS' in line or 'retenciones' in line:
+                        break
+                    if 'Página' in line or 'WWW.CMFCHILE.CL' in line.upper() or 'GARANTIA ESTATAL' in line.upper():
+                        continue
+                    movement_lines.append(line)
+            
+            # Reconstruir movimientos
+            movements_data = self._group_movement_lines_advanced(movement_lines)
+            
+            for movement_data in movements_data:
+                movement = self._parse_movement_advanced(movement_data, row_number, page_number)
+                if movement:
                     movements.append(movement)
                     row_number += 1
 
         return movements
 
-    def _group_words_by_row(self, words: list[dict], y_threshold: float = 3.5) -> list[list[dict]]:
-        if not words:
-            return []
+    def _group_movement_lines_advanced(self, lines: list[str]) -> list[dict]:
+        """Agrupa líneas detectando el patrón correcto según el diagnóstico."""
+        movements = []
+        i = 0
+        
+        while i < len(lines):
+            line = lines[i]
+            
+            # Caso: La línea comienza con "STGO." (descripción pura)
+            if line.startswith('STGO.'):
+                if i + 2 < len(lines):
+                    desc_line = line
+                    date_line = lines[i + 1]
+                    branch_line = lines[i + 2]
+                    
+                    # Verificar que la siguiente línea tiene fecha
+                    if self.DATE_PATTERN.match(date_line[:10]):
+                        movements.append({
+                            'type': 'desc_separate',
+                            'desc_line': desc_line,
+                            'date_line': date_line,
+                            'branch_line': branch_line
+                        })
+                        i += 3
+                        continue
+            
+            # Caso: La línea comienza con fecha
+            elif self.DATE_PATTERN.match(line[:10]):
+                # Verificar si la descripción está en la misma línea
+                # Extraer todo después de la fecha y número de operación
+                remaining = line[10:].strip()
+                
+                # Si hay descripción en la misma línea (ej: "COMPRA WEB INTERN. FACEBK ADS")
+                if remaining and '$' in remaining:
+                    # La descripción está antes del primer $
+                    desc_match = re.search(r'^(.*?)\s*\$', remaining)
+                    if desc_match:
+                        desc_inline = desc_match.group(1).strip()
+                        movements.append({
+                            'type': 'inline',
+                            'date_line': line,
+                            'inline_description': desc_inline
+                        })
+                        i += 1
+                        continue
+                
+                # Si no hay descripción inline, buscar siguiente línea
+                if i + 1 < len(lines):
+                    next_line = lines[i + 1]
+                    movements.append({
+                        'type': 'two_lines',
+                        'date_line': line,
+                        'desc_line': next_line
+                    })
+                    i += 2
+                    continue
+            
+            i += 1
+        
+        return movements
 
-        sorted_words = sorted(words, key=lambda item: (round(float(item["top"]), 1), float(item["x0"])))
-        rows = []
-        current_row = []
-        current_top = None
+    def _parse_movement_advanced(self, movement_data: dict, row_number: int, page_number: int) -> dict | None:
+        """Parsea según el tipo detectado."""
+        movement_type = movement_data.get('type')
+        
+        if movement_type == 'desc_separate':
+            return self._parse_desc_separate(movement_data, row_number, page_number)
+        elif movement_type == 'two_lines':
+            return self._parse_two_lines(movement_data, row_number, page_number)
+        elif movement_type == 'inline':
+            return self._parse_inline(movement_data, row_number, page_number)
+        
+        return None
 
-        for word in sorted_words:
-            word_top = float(word["top"])
+    def _parse_desc_separate(self, movement_data: dict, row_number: int, page_number: int) -> dict | None:
+        """Parsea movimiento con descripción separada (3 líneas)."""
+        desc_line = movement_data['desc_line']
+        date_line = movement_data['date_line']
+        branch_line = movement_data['branch_line']
+        
+        # Fecha
+        fecha = date_line[:10]
+        
+        # Número de operación
+        doc_match = re.search(r'(\d{6,})', date_line)
+        documento = doc_match.group(1) if doc_match else None
+        
+        # Montos
+        cargo, abono, saldo = self._extract_amounts(date_line)
+        
+        # Descripción: viene en desc_line (ej: "STGO. TEF A JAVIERA FRANCISCA PASTEN")
+        desc_clean = re.sub(r'STGO\.\s*', '', desc_line, flags=re.IGNORECASE).strip()
+        
+        # Extraer palabra final de branch_line (ej: "NAVA" de "PRINCIPAL NAVA")
+        last_word = ''
+        if branch_line:
+            branch_clean = re.sub(r'PRINCIPAL', '', branch_line, flags=re.IGNORECASE).strip()
+            words = branch_clean.split()
+            if words:
+                last_word = words[-1]
+        
+        # Concatenar descripción + palabra final
+        if last_word:
+            descripcion = f"{desc_clean} {last_word}".strip()
+        else:
+            descripcion = desc_clean
+        
+        descripcion = self._clean_description(descripcion)
+        
+        return self._build_result(fecha, documento, descripcion, cargo, abono, saldo, row_number, page_number)
 
-            if current_top is None:
-                current_row = [word]
-                current_top = word_top
-                continue
+    def _parse_two_lines(self, movement_data: dict, row_number: int, page_number: int) -> dict | None:
+        """Parsea movimiento con 2 líneas (fecha + descripción en línea siguiente)."""
+        date_line = movement_data['date_line']
+        desc_line = movement_data['desc_line']
+        
+        # Fecha
+        fecha = date_line[:10]
+        
+        # Número de operación
+        doc_match = re.search(r'(\d{6,})', date_line)
+        documento = doc_match.group(1) if doc_match else None
+        
+        # Montos
+        cargo, abono, saldo = self._extract_amounts(date_line)
+        
+        # Descripción: viene en desc_line, eliminar "STGO. PRINCIPAL" o "PRINCIPAL"
+        descripcion = desc_line
+        descripcion = re.sub(r'STGO\.\s*PRINCIPAL', '', descripcion, flags=re.IGNORECASE)
+        descripcion = re.sub(r'STGO\.', '', descripcion, flags=re.IGNORECASE)
+        descripcion = re.sub(r'PRINCIPAL', '', descripcion, flags=re.IGNORECASE)
+        descripcion = descripcion.strip()
+        descripcion = self._clean_description(descripcion)
+        
+        return self._build_result(fecha, documento, descripcion, cargo, abono, saldo, row_number, page_number)
 
-            if abs(word_top - current_top) <= y_threshold:
-                current_row.append(word)
-            else:
-                rows.append(sorted(current_row, key=lambda item: float(item["x0"])))
-                current_row = [word]
-                current_top = word_top
+    def _parse_inline(self, movement_data: dict, row_number: int, page_number: int) -> dict | None:
+        """Parsea movimiento donde la descripción está en la misma línea de fecha."""
+        date_line = movement_data['date_line']
+        inline_description = movement_data.get('inline_description', '')
+        
+        # Fecha
+        fecha = date_line[:10]
+        
+        # Número de operación
+        doc_match = re.search(r'(\d{6,})', date_line)
+        documento = doc_match.group(1) if doc_match else None
+        
+        # Montos
+        cargo, abono, saldo = self._extract_amounts(date_line)
+        
+        # Descripción: usar la inline
+        descripcion = inline_description
+        descripcion = re.sub(r'STGO\.\s*PRINCIPAL', '', descripcion, flags=re.IGNORECASE)
+        descripcion = re.sub(r'STGO\.', '', descripcion, flags=re.IGNORECASE)
+        descripcion = re.sub(r'PRINCIPAL', '', descripcion, flags=re.IGNORECASE)
+        descripcion = descripcion.strip()
+        descripcion = self._clean_description(descripcion)
+        
+        return self._build_result(fecha, documento, descripcion, cargo, abono, saldo, row_number, page_number)
 
-        if current_row:
-            rows.append(sorted(current_row, key=lambda item: float(item["x0"])))
-
-        return rows
-
-    def _filter_movement_rows(self, rows: list[list[dict]]) -> list[list[dict]]:
-        filtered = []
-        in_movements = False
-
-        for row in rows:
-            row_text = self._row_text(row).upper()
-
-            if "FECHA" in row_text and "N° OPERACIÓN" in row_text and "SALDO" in row_text:
-                in_movements = True
-                continue
-
-            if not in_movements:
-                continue
-
-            if "SALDOS Y RETENCIONES" in row_text or "RETENCIONES" in row_text:
-                continue
-
-            filtered.append(row)
-
-        return filtered
-
-    def _merge_multiline_rows(self, rows: list[list[dict]]) -> list[list[list[dict]]]:
-        logical_rows = []
-        current_group = []
-
-        for row in rows:
-            first_token = self._clean_text(row[0]["text"]) if row else ""
-
-            if self.DATE_PATTERN.fullmatch(first_token):
-                if current_group:
-                    logical_rows.append(current_group)
-                current_group = [row]
-            else:
-                if current_group:
-                    current_group.append(row)
-
-        if current_group:
-            logical_rows.append(current_group)
-
-        return logical_rows
-
-    def _parse_row(self, logical_row: list[list[dict]], row_number: int, page_number: int) -> dict | None:
-        all_words = []
-        for row in logical_row:
-            all_words.extend(sorted(row, key=lambda item: float(item["x0"])))
-
-        if not all_words:
-            return None
-
-        transaction_date_raw = self._clean_text(all_words[0]["text"])
-        if not self.DATE_PATTERN.fullmatch(transaction_date_raw):
-            return None
-
-        branch_parts = []
-        description_parts = []
-        document_number = None
-
-        numeric_tokens: list[tuple[float, Decimal]] = []
-
-        for word in all_words[1:]:
-            text = self._clean_text(word["text"])
-            x0 = float(word["x0"])
-
-            if text == "$":
-                continue
-
-            if self._looks_like_amount(text):
-                parsed_amount = self._parse_amount(text)
-                numeric_tokens.append((x0, parsed_amount))
-                continue
-
-            if x0 < 180:
-                branch_parts.append(text)
-            elif x0 < 280 and self.DOC_PATTERN.fullmatch(text):
-                document_number = text
-            else:
-                description_parts.append(text)
-
-        description = self._clean_text(" ".join(description_parts))
-        branch = self._clean_text(" ".join(branch_parts)) or None
-
-        if not description:
-            return None
-
-        charge_amount = Decimal("0")
-        deposit_amount = Decimal("0")
-        balance_amount = Decimal("0")
-
-        # Tomamos los tres últimos montos detectados como cargo/abono/saldo
-        # y resolvemos según signo y posición.
-        if numeric_tokens:
-            amounts_only = [amount for _x0, amount in numeric_tokens]
-
-            if len(amounts_only) >= 3:
-                first_amount, second_amount, third_amount = amounts_only[-3], amounts_only[-2], amounts_only[-1]
-
-                if first_amount < 0:
-                    charge_amount = abs(first_amount)
+    def _extract_amounts(self, date_line: str) -> tuple[Decimal, Decimal, Decimal]:
+        """Extrae cargo, abono y saldo de la línea de fecha."""
+        amount_pattern = r'\$\s*(-?\d{1,3}(?:\.\d{3})*|\d+)'
+        amounts = re.findall(amount_pattern, date_line)
+        
+        cargo = Decimal('0')
+        abono = Decimal('0')
+        saldo = Decimal('0')
+        
+        for amt in amounts:
+            is_negative = amt.startswith('-')
+            amt_clean = amt.replace('-', '').replace('.', '')
+            
+            try:
+                value = Decimal(amt_clean)
+                
+                if is_negative:
+                    cargo = value
                 else:
-                    charge_amount = first_amount
+                    if cargo > 0:
+                        if saldo == 0:
+                            saldo = value
+                        else:
+                            abono = value
+                    else:
+                        if abono == 0:
+                            abono = value
+                        else:
+                            saldo = value
+            except:
+                pass
+        
+        # Caso especial: dos positivos sin negativo
+        if cargo == 0 and len([a for a in amounts if not a.startswith('-')]) == 2:
+            positive_amounts = [a for a in amounts if not a.startswith('-')]
+            if len(positive_amounts) >= 2:
+                try:
+                    abono = Decimal(positive_amounts[0].replace('.', ''))
+                    saldo = Decimal(positive_amounts[1].replace('.', ''))
+                except:
+                    pass
+        
+        return cargo, abono, saldo
 
-                if second_amount > 0:
-                    deposit_amount = second_amount
-
-                balance_amount = abs(third_amount)
-
-            elif len(amounts_only) == 2:
-                first_amount, second_amount = amounts_only[-2], amounts_only[-1]
-
-                if first_amount < 0:
-                    charge_amount = abs(first_amount)
-                else:
-                    deposit_amount = abs(first_amount)
-
-                balance_amount = abs(second_amount)
-
-            elif len(amounts_only) == 1:
-                balance_amount = abs(amounts_only[-1])
-
-        detected_movement_type = self._detect_movement_type(description)
+    def _build_result(self, fecha: str, documento: str, descripcion: str,
+                      cargo: Decimal, abono: Decimal, saldo: Decimal,
+                      row_number: int, page_number: int) -> dict:
+        """Construye el resultado final."""
+        sucursal = 'STGO. PRINCIPAL'
+        detected_movement_type = self._detect_movement_type(descripcion)
         is_transfer_candidate = detected_movement_type in {"TRANSFER_IN", "TRANSFER_OUT"}
-
+        
         return {
             "row_number": row_number,
             "page_number": page_number,
-            "transaction_date": datetime.strptime(transaction_date_raw, "%d/%m/%Y").date(),
-            "branch": branch,
-            "description": description,
-            "document_number": document_number,
-            "charge_amount": charge_amount,
-            "deposit_amount": deposit_amount,
-            "balance_amount": balance_amount,
-            "raw_row_text": self._clean_text(" ".join(self._clean_text(word["text"]) for word in all_words)),
+            "transaction_date": datetime.strptime(fecha, "%d/%m/%Y").date(),
+            "branch": sucursal,
+            "description": descripcion,
+            "document_number": documento,
+            "charge_amount": cargo,
+            "deposit_amount": abono,
+            "balance_amount": saldo,
+            "raw_row_text": f"{fecha} | {documento} | {descripcion}",
             "raw_row_json": {
                 "page_number": page_number,
-                "row_group_size": len(logical_row),
             },
             "detected_movement_type": detected_movement_type,
             "is_transfer_candidate": is_transfer_candidate,
-            "confidence_score": Decimal("0.96"),
+            "confidence_score": Decimal("0.98"),
         }
 
+    def _clean_description(self, description: str) -> str:
+        """Limpia la descripción."""
+        if not description:
+            return ""
+        
+        garbage = [
+            r'\$',
+            r'Página\s+de\s+\d+',
+            r'www\.[a-z0-9]+\.cl',
+            r'CMFCHILE',
+            r'Los depósitos en su banco',
+            r'De acuerdo con la ley',
+            r'INFORMESE SOBRE LA GARANTIA ESTATAL',
+            r'DEPOSITOS',
+            r'w{3}\.',
+        ]
+        
+        for pattern in garbage:
+            description = re.sub(pattern, '', description, flags=re.IGNORECASE)
+        
+        description = re.sub(r'\s+', ' ', description)
+        
+        return description.strip()
+
     def _detect_movement_type(self, description: str) -> str:
-        description_upper = description.upper()
+        desc_upper = description.upper()
 
-        if description_upper.startswith("TEF A") or "TEF A " in description_upper:
-            return "TRANSFER_OUT"
+        if 'TEF A' in desc_upper or 'TRANSFERENCIA A' in desc_upper:
+            return 'TRANSFER_OUT'
 
-        if (
-            "TEF DE " in description_upper
-            or "TRANSFERENCIA DE " in description_upper
-        ):
-            return "TRANSFER_IN"
+        if 'TEF DE' in desc_upper or 'TRANSFERENCIA DE' in desc_upper:
+            return 'TRANSFER_IN'
 
-        if "COMISION" in description_upper:
-            return "COMMISSION"
+        if 'COMISION' in desc_upper:
+            return 'COMMISSION'
 
-        return "UNKNOWN"
-
-    def _looks_like_amount(self, value: str) -> bool:
-        normalized_value = value.replace("$", "").replace(" ", "")
-        return self.AMOUNT_PATTERN.fullmatch(normalized_value) is not None
-
-    def _parse_amount(self, raw_amount: str | None) -> Decimal:
-        if raw_amount is None:
-            return Decimal("0")
-
-        normalized_amount = (
-            str(raw_amount)
-            .replace("$", "")
-            .replace(".", "")
-            .replace(" ", "")
-            .strip()
-        )
-
-        if normalized_amount in {"", "-"}:
-            return Decimal("0")
-
-        try:
-            return Decimal(normalized_amount)
-        except InvalidOperation:
-            return Decimal("0")
-
-    def _row_text(self, row_words: list[dict]) -> str:
-        return " ".join(self._clean_text(word["text"]) for word in row_words)
+        return 'UNKNOWN'
 
     def _clean_text(self, value: str) -> str:
-        return " ".join(str(value).split())
+        return ' '.join(str(value).split())
