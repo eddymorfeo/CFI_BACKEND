@@ -13,13 +13,11 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
     DOCUMENT_NUMBER_PATTERN = re.compile(r"^\d{8,}$")
 
     BRANCH_OPTIONS = [
+        "OFICINA BANCA VIRTUAL",
         "OFICINA LOS ANDES SERVICIO AL",
         "OFICINA SAN FELIPE SERVICIO AL",
-        "OFICINA CENTRAL (SB)",
-        "OFICINA BANCA VIRTUAL",
         "OF. BANCA VIRTUAL",
         "OF. BAN",
-        "OF. SAN",
         "INTERNET",
         "CENTRAL",
     ]
@@ -33,8 +31,6 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
         "MONTO",
         "DEPOSITOS Y",
         "OTROS ABONOS",
-        "O ABONOS",
-        "N° DOCTO MONTO CARGOS",
     }
 
     def can_parse(self, file_path: str) -> bool:
@@ -105,7 +101,7 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
         lines = [self._clean_text(line) for line in page_text.splitlines() if self._clean_text(line)]
 
         ignored_markers = [
-            "ESTADO DE CUENTA",
+            "Estado de Cuenta",
             "CUENTA VISTA",
             "N° DE CUENTA",
             "MONEDA",
@@ -120,15 +116,26 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
             "DETALLE DE TRANSACCION",
             "RETENCION",
             "SALDO DISPONIBLE",
-            "N° MONTO",
-            "N° DOCTO",
         ]
 
-        for line in lines:
+        for index, line in enumerate(lines):
             upper_line = line.upper()
+            if "CUENTA VISTA" in upper_line:
+                for candidate in lines[index + 1 : index + 8]:
+                    candidate_upper = candidate.upper()
+                    if "@" in candidate:
+                        continue
+                    if any(marker in candidate_upper for marker in ignored_markers):
+                        continue
+                    if re.fullmatch(r"\d{8,}", candidate):
+                        continue
+                    return candidate.strip()
+
+        for line in lines:
+            line_upper = line.upper()
             if "@" in line:
                 continue
-            if any(marker in upper_line for marker in ignored_markers):
+            if any(marker in line_upper for marker in ignored_markers):
                 continue
             if re.fullmatch(r"\d{8,}", line):
                 continue
@@ -307,7 +314,7 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
 
     def _split_row_columns(self, body: str) -> dict | None:
         tokens = body.split()
-        if len(tokens) < 3:
+        if len(tokens) < 4:
             return None
 
         branch_match = self._find_branch(tokens)
@@ -327,106 +334,27 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
         description = self._clean_text(" ".join(description_tokens))
         branch = branch_value
 
-        # Estrategia 1: formato nuevo -> branch + document + movement + balance (+ continuaciones)
-        parsed_new = self._try_parse_new_format(description, branch, trailing_tokens)
-        if parsed_new is not None:
-            return parsed_new
-
-        # Estrategia 2: formato antiguo -> branch + movement + balance (+ continuaciones)
-        parsed_old = self._try_parse_old_format(description, branch, trailing_tokens)
-        if parsed_old is not None:
-            return parsed_old
-
-        return None
-
-    def _try_parse_new_format(self, description: str, branch: str, trailing_tokens: list[str]) -> dict | None:
-        if len(trailing_tokens) < 3:
-            return None
-
         document_number = trailing_tokens[0]
         if not self.DOCUMENT_NUMBER_PATTERN.fullmatch(document_number):
             return None
 
-        remainder_tokens = trailing_tokens[1:]
-        amount_tokens = [token for token in remainder_tokens if self._is_amount_token(token)]
+        amount_tokens = trailing_tokens[1:]
+        parsed_amounts = self._parse_amount_columns(amount_tokens, description)
 
-        if len(amount_tokens) < 2:
+        if parsed_amounts is None:
             return None
 
-        movement_amount = self._parse_amount(amount_tokens[0])
-        balance_amount = self._parse_amount(amount_tokens[1])
-
-        continuation_tokens = [
-            token for token in remainder_tokens
-            if token not in amount_tokens[:2]
-        ]
-
-        embedded_document_number = self._extract_embedded_document_number(" ".join(continuation_tokens))
+        embedded_document_number = self._extract_embedded_document_number(description)
         if embedded_document_number and document_number == "00000000":
             document_number = embedded_document_number
 
-        description_suffix = self._build_description_suffix(continuation_tokens)
-        if description_suffix:
-            description = self._clean_text(f"{description} {description_suffix}")
-
-        movement_type = self._detect_movement_type(description)
-
-        if movement_type in {"TRANSFER_IN", "REFUND"}:
-            charge_amount = Decimal("0")
-            deposit_amount = movement_amount
-        else:
-            charge_amount = movement_amount
-            deposit_amount = Decimal("0")
-
         return {
             "description": description,
             "branch": branch,
             "document_number": document_number,
-            "charge_amount": charge_amount,
-            "deposit_amount": deposit_amount,
-            "balance_amount": balance_amount,
-        }
-
-    def _try_parse_old_format(self, description: str, branch: str, trailing_tokens: list[str]) -> dict | None:
-        amount_tokens = [token for token in trailing_tokens if self._is_amount_token(token)]
-        if len(amount_tokens) < 2:
-            return None
-
-        movement_amount = self._parse_amount(amount_tokens[0])
-        balance_amount = self._parse_amount(amount_tokens[1])
-
-        remaining_tokens = trailing_tokens.copy()
-
-        for token in amount_tokens[:2]:
-            if token in remaining_tokens:
-                remaining_tokens.remove(token)
-
-        document_number = None
-        embedded_doc = self._extract_embedded_document_number(" ".join(remaining_tokens))
-        if embedded_doc:
-            document_number = embedded_doc
-            remaining_tokens = [token for token in remaining_tokens if token != embedded_doc]
-
-        description_suffix = self._build_description_suffix(remaining_tokens)
-        if description_suffix:
-            description = self._clean_text(f"{description} {description_suffix}")
-
-        movement_type = self._detect_movement_type(description)
-
-        if movement_type in {"TRANSFER_IN", "REFUND"}:
-            charge_amount = Decimal("0")
-            deposit_amount = movement_amount
-        else:
-            charge_amount = movement_amount
-            deposit_amount = Decimal("0")
-
-        return {
-            "description": description,
-            "branch": branch,
-            "document_number": document_number,
-            "charge_amount": charge_amount,
-            "deposit_amount": deposit_amount,
-            "balance_amount": balance_amount,
+            "charge_amount": parsed_amounts["charge_amount"],
+            "deposit_amount": parsed_amounts["deposit_amount"],
+            "balance_amount": parsed_amounts["balance_amount"],
         }
 
     def _find_branch(self, tokens: list[str]) -> tuple[int, int, str] | None:
@@ -443,17 +371,53 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
 
         return None
 
-    def _build_description_suffix(self, tokens: list[str]) -> str:
-        if not tokens:
-            return ""
+    def _parse_amount_columns(self, tokens: list[str], description: str) -> dict | None:
+        amount_like_tokens = [token for token in tokens if self._is_amount_token(token)]
 
-        suffix_tokens = []
-        for token in tokens:
-            if self.DOCUMENT_NUMBER_PATTERN.fullmatch(token):
-                continue
-            suffix_tokens.append(token)
+        if len(amount_like_tokens) < 2:
+            return None
 
-        return self._clean_text(" ".join(suffix_tokens))
+        if len(amount_like_tokens) == 2:
+            movement_amount = self._parse_amount(amount_like_tokens[0])
+            balance_amount = self._parse_amount(amount_like_tokens[1])
+
+            movement_type = self._detect_movement_type(description)
+            if movement_type in {"TRANSFER_IN", "REFUND"}:
+                return {
+                    "charge_amount": Decimal("0"),
+                    "deposit_amount": movement_amount,
+                    "balance_amount": balance_amount,
+                }
+
+            return {
+                "charge_amount": movement_amount,
+                "deposit_amount": Decimal("0"),
+                "balance_amount": balance_amount,
+            }
+
+        first_amount = self._parse_amount(amount_like_tokens[0])
+        second_amount = self._parse_amount(amount_like_tokens[1])
+        balance_amount = self._parse_amount(amount_like_tokens[2])
+
+        if first_amount == 0 and second_amount > 0:
+            return {
+                "charge_amount": Decimal("0"),
+                "deposit_amount": second_amount,
+                "balance_amount": balance_amount,
+            }
+
+        if second_amount == 0 and first_amount > 0:
+            return {
+                "charge_amount": first_amount,
+                "deposit_amount": Decimal("0"),
+                "balance_amount": balance_amount,
+            }
+
+        return {
+            "charge_amount": first_amount,
+            "deposit_amount": second_amount,
+            "balance_amount": balance_amount,
+        }
 
     def _extract_embedded_document_number(self, text: str) -> str | None:
         candidates = re.findall(r"\b\d{8,}\b", text)
