@@ -7,22 +7,21 @@ import pdfplumber
 from app.parsers.base_parser import BaseParser
 
 
-class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
+class BancoChileCuentaCorrienteEstadoCuentaParser(BaseParser):
     DATE_MM_PATTERN = re.compile(r"^\d{2}/\d{2}$")
     DATE_DDMMYYYY_PATTERN = re.compile(r"^\d{2}/\d{2}/\d{4}$")
     DATE_PREFIX_PATTERN = re.compile(r"^(?P<date>\d{2}/\d{2})\s+(?P<body>.+)$")
     DATE_FULL_PREFIX_PATTERN = re.compile(r"^(?P<date>\d{2}/\d{2}/\d{4})\s+(?P<body>.+)$")
-    DOCUMENT_NUMBER_PATTERN = re.compile(r"^\d{8,}$")
+    DOCUMENT_NUMBER_PATTERN = re.compile(r"^\d{7,}$")
 
     BRANCH_OPTIONS = [
         "OFICINA LOS ANDES SERVICIO AL",
         "OFICINA SAN FELIPE SERVICIO AL",
         "OFICINA CENTRAL (SB)",
         "OFICINA CENTRAL",
-        "OFICINA BANCA VIRTUAL",
-        "OF. BANCA VIRTUAL",
-        "OF. BAN",
+        "OF. SAN FELIPE",
         "OF. SAN",
+        "OF. BAN",
         "INTERNET",
         "CENTRAL",
         "BANCA MOVIL",
@@ -37,15 +36,20 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
 
     HEADER_STOP_LINES = {
         "DIA/MES",
+        "DIA/ME",
         "SUCURSAL",
-        "CARGOS",
-        "SALDO",
-        "N°",
-        "MONTO",
-        "DEPOSITOS Y",
-        "OTROS ABONOS",
+        "N° DOCTO",
+        "MONTO CHEQUES",
+        "O CARGOS",
+        "MONTO DEPOSITOS",
         "O ABONOS",
-        "N° DOCTO MONTO CARGOS",
+        "SALDO",
+        "CHEQUES",
+        "DEPOSITOS",
+        "OTROS ABONOS",
+        "OTROS CARGOS",
+        "GIROS CAJERO AUTOMATICO",
+        "IMPUESTOS",
     }
 
     NEW_FORMAT_HEADER_STOP_LINES = {
@@ -74,8 +78,9 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
 
         has_classic_format = (
             "ESTADO DE CUENTA" in normalized_text
-            and "CUENTA VISTA" in normalized_text
-            and "N° DE CUENTA" in normalized_text
+            and "CUENTA CORRIENTE" in normalized_text
+            and "DETALLE DE TRANSACCION" in normalized_text
+            and "N° DOCTO" in normalized_text
         )
 
         has_new_format = (
@@ -106,10 +111,10 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
         movements = self._extract_movements(pages)
 
         return {
-            "parser_code": "BANCO_CHILE_CUENTA_VISTA_ESTADO_CUENTA",
+            "parser_code": "BANCO_CHILE_CUENTA_CORRIENTE_ESTADO_CUENTA",
             "document_metadata": {
                 **document_metadata,
-                "detected_statement_type": "CUENTA_VISTA",
+                "detected_statement_type": "CUENTA_CORRIENTE",
             },
             "movements": movements,
         }
@@ -196,7 +201,7 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
 
         ignored_markers = [
             "ESTADO DE CUENTA",
-            "CUENTA VISTA",
+            "CUENTA CORRIENTE",
             "N° DE CUENTA",
             "MONEDA",
             "EJECUTIVO DE CUENTA",
@@ -208,10 +213,13 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
             "N° DE PAGINA",
             "FECHA",
             "DETALLE DE TRANSACCION",
+            "LINEA DE CREDITO",
             "RETENCION",
             "SALDO DISPONIBLE",
-            "N° MONTO",
-            "N° DOCTO",
+            "APROBADO",
+            "UTILIZADO",
+            "DISPONIBLE",
+            "VENCIMIENTO",
             "SALDO Y MOVIMIENTOS DE CUENTA",
             "MOVIMIENTOS DESDE",
             "Nº DOCUMENTO",
@@ -394,7 +402,7 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
             "raw_row_text": row_text,
             "raw_row_json": {
                 "page_number": page_number,
-                "source_format": "BANCO_CHILE_CUENTA_VISTA_NEW_FORMAT",
+                "source_format": "BANCO_CHILE_CUENTA_CORRIENTE_NEW_FORMAT",
                 "parsed_columns": {
                     "description": description,
                     "branch": branch,
@@ -458,9 +466,6 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
                 continue
 
             if line_upper in self.HEADER_STOP_LINES:
-                continue
-
-            if re.fullmatch(r"0(?:\s+0)+\s+\d{1,3}(?:[.,]\d{3})*", line_upper):
                 continue
 
             if re.fullmatch(r"0(?:\s+0)+", line_upper):
@@ -529,11 +534,11 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
 
         detected_movement_type = self._detect_movement_type(description)
 
-        if detected_movement_type in {"TRANSFER_IN", "REFUND"} and charge_amount > 0 and deposit_amount == 0:
+        if detected_movement_type in {"TRANSFER_IN", "DEPOSIT", "REFUND"} and charge_amount > 0 and deposit_amount == 0:
             deposit_amount = charge_amount
             charge_amount = Decimal("0")
 
-        if detected_movement_type in {"PURCHASE", "TRANSFER_OUT"} and deposit_amount > 0 and charge_amount == 0:
+        if detected_movement_type in {"PURCHASE", "TRANSFER_OUT", "FEE", "WITHDRAWAL"} and deposit_amount > 0 and charge_amount == 0:
             charge_amount = deposit_amount
             deposit_amount = Decimal("0")
 
@@ -553,7 +558,7 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
             "raw_row_text": row_text,
             "raw_row_json": {
                 "page_number": page_number,
-                "source_format": "BANCO_CHILE_CUENTA_VISTA",
+                "source_format": "BANCO_CHILE_CUENTA_CORRIENTE",
                 "parsed_columns": {
                     "description": description,
                     "branch": branch,
@@ -570,7 +575,7 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
 
     def _split_row_columns(self, body: str) -> dict | None:
         tokens = body.split()
-        if len(tokens) < 3:
+        if len(tokens) < 2:
             return None
 
         branch_match = self._find_branch(tokens)
@@ -584,111 +589,135 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
         description_tokens = tokens[:branch_start_index]
         trailing_tokens = tokens[branch_start_index + branch_token_count :]
 
-        if len(trailing_tokens) < 2:
-            return None
-
         description = self._clean_text(" ".join(description_tokens))
         branch = branch_value
 
-        parsed_new = self._try_parse_new_format(description, branch, trailing_tokens)
-        if parsed_new is not None:
-            return parsed_new
-
-        parsed_old = self._try_parse_old_format(description, branch, trailing_tokens)
-        if parsed_old is not None:
-            return parsed_old
-
-        return None
-
-    def _try_parse_new_format(self, description: str, branch: str, trailing_tokens: list[str]) -> dict | None:
-        if len(trailing_tokens) < 3:
+        if not trailing_tokens:
             return None
-
-        document_number = trailing_tokens[0]
-        if not self.DOCUMENT_NUMBER_PATTERN.fullmatch(document_number):
-            return None
-
-        remainder_tokens = trailing_tokens[1:]
-        amount_tokens = [token for token in remainder_tokens if self._is_amount_token(token)]
-
-        if len(amount_tokens) < 2:
-            return None
-
-        movement_amount = self._parse_amount(amount_tokens[0])
-        balance_amount = self._parse_amount(amount_tokens[1])
-
-        continuation_tokens = [
-            token for token in remainder_tokens
-            if token not in amount_tokens[:2]
-        ]
-
-        embedded_document_number = self._extract_embedded_document_number(" ".join(continuation_tokens))
-        if embedded_document_number and document_number == "00000000":
-            document_number = embedded_document_number
-
-        description_suffix = self._build_description_suffix(continuation_tokens)
-        if description_suffix:
-            description = self._clean_text(f"{description} {description_suffix}")
-
-        movement_type = self._detect_movement_type(description)
-
-        if movement_type in {"TRANSFER_IN", "REFUND"}:
-            charge_amount = Decimal("0")
-            deposit_amount = movement_amount
-        else:
-            charge_amount = movement_amount
-            deposit_amount = Decimal("0")
-
-        return {
-            "description": description,
-            "branch": branch,
-            "document_number": document_number,
-            "charge_amount": charge_amount,
-            "deposit_amount": deposit_amount,
-            "balance_amount": balance_amount,
-        }
-
-    def _try_parse_old_format(self, description: str, branch: str, trailing_tokens: list[str]) -> dict | None:
-        amount_tokens = [token for token in trailing_tokens if self._is_amount_token(token)]
-        if len(amount_tokens) < 2:
-            return None
-
-        movement_amount = self._parse_amount(amount_tokens[0])
-        balance_amount = self._parse_amount(amount_tokens[1])
-
-        remaining_tokens = trailing_tokens.copy()
-
-        for token in amount_tokens[:2]:
-            if token in remaining_tokens:
-                remaining_tokens.remove(token)
 
         document_number = None
-        embedded_doc = self._extract_embedded_document_number(" ".join(remaining_tokens))
-        if embedded_doc:
-            document_number = embedded_doc
-            remaining_tokens = [token for token in remaining_tokens if token != embedded_doc]
+        amount_tokens: list[str] = []
+        extra_tokens: list[str] = []
 
-        description_suffix = self._build_description_suffix(remaining_tokens)
+        first_token = trailing_tokens[0]
+
+        if self.DOCUMENT_NUMBER_PATTERN.fullmatch(first_token) and len(trailing_tokens) >= 2:
+            document_number = first_token
+            remainder = trailing_tokens[1:]
+        else:
+            remainder = trailing_tokens
+
+        for token in remainder:
+            if self._is_amount_token(token):
+                amount_tokens.append(token)
+            else:
+                extra_tokens.append(token)
+
+        if not amount_tokens:
+            return None
+
+        embedded_document_number = self._extract_embedded_document_number(" ".join(extra_tokens))
+        if embedded_document_number and document_number is None:
+            document_number = embedded_document_number
+
+        description_suffix = self._build_description_suffix(extra_tokens)
         if description_suffix:
             description = self._clean_text(f"{description} {description_suffix}")
 
+        return self._resolve_amount_columns(
+            description=description,
+            branch=branch,
+            document_number=document_number,
+            amount_tokens=amount_tokens,
+        )
+
+    def _resolve_amount_columns(
+        self,
+        description: str,
+        branch: str,
+        document_number: str | None,
+        amount_tokens: list[str],
+    ) -> dict | None:
         movement_type = self._detect_movement_type(description)
 
-        if movement_type in {"TRANSFER_IN", "REFUND"}:
-            charge_amount = Decimal("0")
-            deposit_amount = movement_amount
-        else:
-            charge_amount = movement_amount
-            deposit_amount = Decimal("0")
+        if len(amount_tokens) == 1:
+            movement_amount = self._parse_amount(amount_tokens[0])
 
-        return {
-            "description": description,
-            "branch": branch,
-            "document_number": document_number,
-            "charge_amount": charge_amount,
-            "deposit_amount": deposit_amount,
-            "balance_amount": balance_amount,
-        }
+            if movement_type in {"TRANSFER_IN", "DEPOSIT", "REFUND"}:
+                return {
+                    "description": description,
+                    "branch": branch,
+                    "document_number": document_number,
+                    "charge_amount": Decimal("0"),
+                    "deposit_amount": movement_amount,
+                    "balance_amount": Decimal("0"),
+                }
+
+            return {
+                "description": description,
+                "branch": branch,
+                "document_number": document_number,
+                "charge_amount": movement_amount,
+                "deposit_amount": Decimal("0"),
+                "balance_amount": Decimal("0"),
+            }
+
+        if len(amount_tokens) >= 2:
+            first_amount = self._parse_amount(amount_tokens[0])
+            second_amount = self._parse_amount(amount_tokens[1])
+
+            if len(amount_tokens) == 2:
+                if movement_type in {"TRANSFER_IN", "DEPOSIT", "REFUND"}:
+                    return {
+                        "description": description,
+                        "branch": branch,
+                        "document_number": document_number,
+                        "charge_amount": Decimal("0"),
+                        "deposit_amount": first_amount,
+                        "balance_amount": second_amount,
+                    }
+
+                return {
+                    "description": description,
+                    "branch": branch,
+                    "document_number": document_number,
+                    "charge_amount": first_amount,
+                    "deposit_amount": Decimal("0"),
+                    "balance_amount": second_amount,
+                }
+
+            third_amount = self._parse_amount(amount_tokens[2])
+
+            if first_amount == 0 and second_amount > 0:
+                return {
+                    "description": description,
+                    "branch": branch,
+                    "document_number": document_number,
+                    "charge_amount": Decimal("0"),
+                    "deposit_amount": second_amount,
+                    "balance_amount": third_amount,
+                }
+
+            if second_amount == 0 and first_amount > 0:
+                return {
+                    "description": description,
+                    "branch": branch,
+                    "document_number": document_number,
+                    "charge_amount": first_amount,
+                    "deposit_amount": Decimal("0"),
+                    "balance_amount": third_amount,
+                }
+
+            return {
+                "description": description,
+                "branch": branch,
+                "document_number": document_number,
+                "charge_amount": first_amount,
+                "deposit_amount": second_amount,
+                "balance_amount": third_amount,
+            }
+
+        return None
 
     def _find_branch(self, tokens: list[str]) -> tuple[int, int, str] | None:
         branch_variants = []
@@ -717,7 +746,7 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
         return self._clean_text(" ".join(suffix_tokens))
 
     def _extract_embedded_document_number(self, text: str) -> str | None:
-        candidates = re.findall(r"\b\d{8,}\b", text)
+        candidates = re.findall(r"\b\d{7,}\b", text)
         if not candidates:
             return None
         return candidates[0]
@@ -747,21 +776,37 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
         if "TRASPASO DE:" in description_upper or "TRASPASO DE CUENTA:" in description_upper:
             return "TRANSFER_IN"
 
-        if "ABONO SEGUN INSTRUC." in description_upper:
-            return "TRANSFER_IN"
+        if "ABONO POR CAPTACIONES" in description_upper:
+            return "DEPOSIT"
+
+        if "DEP.CHEQ.OTROS BANCOS" in description_upper:
+            return "DEPOSIT"
 
         if "DEVOLUCION:" in description_upper:
             return "REFUND"
 
+        if "GIRO CAJERO AUTOMATICO" in description_upper:
+            return "WITHDRAWAL"
+
         if (
-            "PAGO:" in description_upper
-            or "REGULARIZACION DE CARGOS" in description_upper
+            "CHEQUE DEPOSITADO DEVUELTO" in description_upper
             or "CARGO POR PAGO TC" in description_upper
-            or "GIRO CAJERO AUTOMATICO" in description_upper
-            or "COMISION " in description_upper
-            or "COMISION GIRO" in description_upper
-            or "COMISION GIROS" in description_upper
-            or "PAP " in description_upper
+            or "CARGO POR CAPTACIONES" in description_upper
+            or "PAGO:" in description_upper
+            or "PAGO TARJETA DE CREDITO" in description_upper
+            or "PAGO LINEA DE CRED" in description_upper
+            or "PAGO EN SERVIPAG" in description_upper
+            or "PAGO EN TESORERIA" in description_upper
+            or "PAGO:DE SUELDOS" in description_upper
+            or "PAGO:PROVEEDORES" in description_upper
+            or "PAGO SERVICIO" in description_upper
+            or "PAGO SERVICIO EN INTERNET" in description_upper
+            or "PAGO SERVICIO EN MI BANCO" in description_upper
+            or "INTERESES LINEA DE CREDITO" in description_upper
+            or "IMPUESTO LINEA DE CREDITO" in description_upper
+            or "PRIMA SEGURO DESGRAVAMEN" in description_upper
+            or "APORTE TELETON" in description_upper
+            or "RECAUDACION Y PAGOS DE SERVICIOS" in description_upper
         ):
             return "PURCHASE"
 
