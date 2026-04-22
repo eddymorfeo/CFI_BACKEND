@@ -1,11 +1,11 @@
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import HTTPException, UploadFile, status
+from fastapi import UploadFile, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
+from app.core.errors import AppException
 from app.models.extracted_movement import ExtractedMovement
 from app.models.source_document import SourceDocument
 from app.services.document_classifier_service import DocumentClassifierService
@@ -37,15 +37,18 @@ class DocumentService:
             database.refresh(source_document)
         except IntegrityError:
             database.rollback()
-            raise HTTPException(
+            raise AppException(
+                error_code="DOCUMENT_ALREADY_EXISTS",
+                message="Este archivo ya fue cargado anteriormente.",
+                detail=f"El archivo '{upload_file.filename}' ya existe en la plataforma.",
                 status_code=status.HTTP_409_CONFLICT,
-                detail="El archivo ya fue cargado anteriormente.",
+                context={"original_file_name": upload_file.filename},
             )
 
         return source_document
 
     @staticmethod
-    def list_documents(database, skip: int = 0, limit: int = 50):
+    def list_documents(database: Session, skip: int = 0, limit: int = 50):
         documents = (
             database.query(SourceDocument)
             .order_by(SourceDocument.uploaded_at.desc())
@@ -55,10 +58,8 @@ class DocumentService:
         )
 
         response = []
-
         for document in documents:
             parser_code = getattr(document, "parser_code", None)
-
             response.append(
                 {
                     "source_document_id": document.source_document_id,
@@ -81,7 +82,7 @@ class DocumentService:
         return response
 
     @staticmethod
-    def get_document_by_id(database, source_document_id):
+    def get_document_by_id(database: Session, source_document_id):
         document = (
             database.query(SourceDocument)
             .filter(SourceDocument.source_document_id == source_document_id)
@@ -89,7 +90,11 @@ class DocumentService:
         )
 
         if document is None:
-            raise HTTPException(status_code=404, detail="Documento no encontrado.")
+            raise AppException(
+                error_code="DOCUMENT_NOT_FOUND",
+                message="No encontramos el documento solicitado.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
 
         parser_code = getattr(document, "parser_code", None)
 
@@ -115,7 +120,7 @@ class DocumentService:
         }
 
     @staticmethod
-    def delete_document(database, source_document_id):
+    def delete_document(database: Session, source_document_id):
         document = (
             database.query(SourceDocument)
             .filter(SourceDocument.source_document_id == source_document_id)
@@ -123,9 +128,10 @@ class DocumentService:
         )
 
         if document is None:
-            raise HTTPException(
+            raise AppException(
+                error_code="DOCUMENT_NOT_FOUND",
+                message="No se pudo eliminar porque el documento no existe.",
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Documento no encontrado.",
             )
 
         database.query(ExtractedMovement).filter(

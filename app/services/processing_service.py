@@ -1,8 +1,9 @@
 from uuid import UUID
 
-from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
+from fastapi import status
 
+from app.core.errors import AppException
 from app.models.extracted_movement import ExtractedMovement
 from app.models.source_document import SourceDocument
 from app.parsers.parser_registry import get_available_parsers
@@ -18,24 +19,44 @@ class ProcessingService:
         )
 
         if source_document is None:
-            raise HTTPException(
+            raise AppException(
+                error_code="DOCUMENT_NOT_FOUND",
+                message="No encontramos el documento que intentas procesar.",
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Documento no encontrado.",
             )
 
         selected_parser = None
+
         for parser in get_available_parsers():
             if parser.can_parse(source_document.file_path):
                 selected_parser = parser
                 break
 
         if selected_parser is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No existe un parser compatible para este formato de documento.",
+            source_document.processing_status = "FAILED"
+            database.commit()
+
+            raise AppException(
+                error_code="UNSUPPORTED_DOCUMENT_FORMAT",
+                message="No pudimos reconocer el formato de esta cartola.",
+                detail="No existe un parser compatible para este documento.",
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                context={"original_file_name": source_document.original_file_name},
             )
 
-        parsed_result = selected_parser.parse(source_document.file_path)
+        try:
+            parsed_result = selected_parser.parse(source_document.file_path)
+        except Exception as exception:
+            source_document.processing_status = "FAILED"
+            database.commit()
+
+            raise AppException(
+                error_code="DOCUMENT_PROCESSING_FAILED",
+                message="El documento se cargó, pero falló su procesamiento.",
+                detail=str(exception),
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                context={"original_file_name": source_document.original_file_name},
+            )
 
         database.query(ExtractedMovement).filter(
             ExtractedMovement.source_document_id == source_document_id

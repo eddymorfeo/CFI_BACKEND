@@ -1,20 +1,21 @@
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Query, UploadFile, status
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.errors import AppException
 from app.schemas.document_schema import (
     SourceDocumentDetailResponse,
     SourceDocumentResponse,
 )
-from app.services.document_service import DocumentService
-from app.services.processing_service import ProcessingService
 from app.schemas.export_schema import ExportCartolaBancariaResponse
+from app.services.document_service import DocumentService
 from app.services.export_service import ExportService
-from fastapi.responses import FileResponse
+from app.services.processing_service import ProcessingService
 
 router = APIRouter(prefix="/documents", tags=["Documents"])
 
@@ -29,18 +30,22 @@ async def upload_document(
     database: Session = Depends(get_db),
 ):
     if not file.filename:
-        raise HTTPException(
+        raise AppException(
+            error_code="FILE_MISSING",
+            message="Debes seleccionar un archivo antes de subirlo.",
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Debe seleccionar un archivo.",
         )
 
     file_extension = Path(file.filename).suffix.lower()
     allowed_extensions = {".pdf", ".xlsx", ".xls", ".csv"}
 
     if file_extension not in allowed_extensions:
-        raise HTTPException(
+        raise AppException(
+            error_code="INVALID_FILE_TYPE",
+            message="El tipo de archivo no es válido.",
+            detail="Solo se aceptan archivos PDF, XLSX, XLS o CSV.",
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Tipo de archivo no permitido. Solo se aceptan PDF, XLSX, XLS y CSV.",
+            context={"file_extension": file_extension},
         )
 
     max_bytes = settings.max_file_size_mb * 1024 * 1024
@@ -49,9 +54,12 @@ async def upload_document(
     file.file.seek(0)
 
     if file_size > max_bytes:
-        raise HTTPException(
+        raise AppException(
+            error_code="FILE_TOO_LARGE",
+            message="El archivo supera el tamaño permitido.",
+            detail=f"El tamaño máximo permitido es de {settings.max_file_size_mb} MB.",
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"El archivo supera el tamaño máximo permitido de {settings.max_file_size_mb} MB.",
+            context={"max_file_size_mb": settings.max_file_size_mb},
         )
 
     return await DocumentService.upload_document(
@@ -87,6 +95,7 @@ def get_document_detail(
         source_document_id=source_document_id,
     )
 
+
 @router.post(
     "/{source_document_id}/process",
     status_code=status.HTTP_200_OK,
@@ -99,7 +108,7 @@ def process_document(
         database=database,
         source_document_id=source_document_id,
     )
-    
+
 
 @router.get(
     "/{source_document_id}/export/cartola-bancaria",
@@ -119,7 +128,7 @@ def export_cartola_bancaria(
         media_type="text/csv",
         filename="formato_cartola_bancaria.csv",
     )
-    
+
 
 @router.delete(
     "/{source_document_id}",
