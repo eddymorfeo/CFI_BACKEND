@@ -68,26 +68,32 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
             return False
 
         with pdfplumber.open(path) as pdf:
-            first_page_text = pdf.pages[0].extract_text() or ""
+            page_texts = [page.extract_text() or "" for page in pdf.pages]
 
-        normalized_text = self._clean_text(first_page_text).upper()
+        normalized_pages = [self._clean_text(text).upper() for text in page_texts]
+        normalized_document = "\n".join(normalized_pages)
 
-        has_classic_format = (
+        if "CUENTA CORRIENTE" in normalized_document and "CUENTA VISTA" not in normalized_document:
+            return False
+
+        has_classic_format = any(
             "ESTADO DE CUENTA" in normalized_text
             and "CUENTA VISTA" in normalized_text
             and "N° DE CUENTA" in normalized_text
+            for normalized_text in normalized_pages
         )
 
-        has_new_format = (
+        has_new_format = any(
             "SALDO Y MOVIMIENTOS DE CUENTA" in normalized_text
             and "MOVIMIENTOS DESDE" in normalized_text
             and ("Nº DOCUMENTO" in normalized_text or "N° DOCUMENTO" in normalized_text)
             and "CARGOS (CLP)" in normalized_text
             and "ABONOS (CLP)" in normalized_text
             and "SALDO (CLP)" in normalized_text
+            for normalized_text in normalized_pages
         )
 
-        return has_classic_format or has_new_format
+        return has_classic_format or ("CUENTA VISTA" in normalized_document and has_new_format)
 
     def parse(self, file_path: str) -> dict:
         path = self.validate_file_exists(file_path)
@@ -135,18 +141,11 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
             if dashed_account_match:
                 account_match_value = re.sub(r"\D", "", dashed_account_match.group(0))
 
-        period_match = re.search(
-            r"(\d{2}/\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})",
-            first_page_text,
-            re.IGNORECASE,
-        )
-
-        if not period_match:
-            period_match = re.search(
-                r"Movimientos desde (\d{2}/\d{2}/\d{4}) al (\d{2}/\d{2}/\d{4})",
-                normalized_first_page_text,
-                re.IGNORECASE,
-            )
+        document_period = None
+        for page in pages:
+            document_period = self._extract_period(page["text"])
+            if document_period:
+                break
 
         holder_name = self._extract_holder_name(first_page_text)
 
@@ -175,8 +174,8 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
             "detected_institution_name": "Banco de Chile",
             "detected_holder_name": holder_name,
             "detected_account_number": account_match_value,
-            "document_date_from": datetime.strptime(period_match.group(1), "%d/%m/%Y").date() if period_match else None,
-            "document_date_to": datetime.strptime(period_match.group(2), "%d/%m/%Y").date() if period_match else None,
+            "document_date_from": document_period[0] if document_period else None,
+            "document_date_to": document_period[1] if document_period else None,
             "detected_available_balance": self._parse_amount(available_balance_match.group(1)) if available_balance_match else None,
             "detected_accounting_balance": self._parse_amount(accounting_balance_match.group(1)) if accounting_balance_match else None,
             "detected_total_charges": self._parse_amount(total_charges_match.group(1)) if total_charges_match else None,
@@ -277,7 +276,7 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
 
     def _is_new_format_page(self, page_text: str) -> bool:
         normalized_text = self._clean_text(page_text).upper()
-        return (
+        has_full_header = (
             "SALDO Y MOVIMIENTOS DE CUENTA" in normalized_text
             and "MOVIMIENTOS DESDE" in normalized_text
             and ("Nº DOCUMENTO" in normalized_text or "N° DOCUMENTO" in normalized_text)
@@ -286,11 +285,30 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
             and "SALDO (CLP)" in normalized_text
         )
 
+        has_continuation_header = (
+            "FECHA" in normalized_text
+            and "DESCRIP" in normalized_text
+            and "CARGOS (CLP)" in normalized_text
+            and "ABONOS (CLP)" in normalized_text
+            and "SALDO (CLP)" in normalized_text
+            and ("CANAL" in normalized_text or "SUCURSAL" in normalized_text)
+        )
+
+        return has_full_header or has_continuation_header
+
     def _extract_new_format_rows(self, page_text: str) -> list[str]:
         page_lines = [self._clean_text(line) for line in page_text.splitlines() if self._clean_text(line)]
 
         relevant_rows: list[str] = []
         in_table = False
+        current_row: str | None = None
+        pending_description_prefix: str | None = None
+
+        def flush_current_row():
+            nonlocal current_row
+            if current_row:
+                relevant_rows.append(current_row)
+                current_row = None
 
         for line in page_lines:
             line_upper = line.upper()
@@ -315,8 +333,29 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
                 continue
 
             if len(line) >= 10 and self.DATE_DDMMYYYY_PATTERN.fullmatch(line[:10]):
-                relevant_rows.append(line)
+                flush_current_row()
+                if pending_description_prefix:
+                    current_row = f"{line[:10]} {pending_description_prefix} {line[10:].strip()}"
+                    pending_description_prefix = None
+                else:
+                    current_row = line
+                continue
 
+            if current_row:
+                if self._looks_like_new_format_description_prefix(line):
+                    flush_current_row()
+                    pending_description_prefix = line
+                    continue
+
+                current_row = f"{current_row} {line}"
+                continue
+
+            if pending_description_prefix:
+                pending_description_prefix = f"{pending_description_prefix} {line}"
+            else:
+                pending_description_prefix = line
+
+        flush_current_row()
         return relevant_rows
 
     def _parse_new_format_row(
@@ -338,41 +377,40 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
         if len(tokens) < 5:
             return None
 
-        charge_token = tokens[-3]
-        deposit_token = tokens[-2]
-        balance_token = tokens[-1]
-
-        if not self._is_amount_token(charge_token):
-            return None
-        if not self._is_amount_token(deposit_token):
-            return None
-        if not self._is_amount_token(balance_token):
-            return None
-
-        header_tokens = tokens[:-3]
-        if len(header_tokens) < 2:
-            return None
-
-        channel_match = self._find_new_format_channel(header_tokens)
+        channel_match = self._find_new_format_channel(tokens)
         if channel_match is None:
             return None
 
         channel_start_index, channel_token_count, channel_value = channel_match
 
-        description_tokens = header_tokens[:channel_start_index]
-        post_channel_tokens = header_tokens[channel_start_index + channel_token_count :]
+        description_tokens = tokens[:channel_start_index]
+        post_channel_tokens = tokens[channel_start_index + channel_token_count :]
 
         if not description_tokens:
             return None
 
-        description = self._clean_text(" ".join(description_tokens))
-        branch = channel_value
-
         document_number = None
-        if post_channel_tokens:
+        if post_channel_tokens and not self._is_amount_token(post_channel_tokens[0]):
             candidate_document = post_channel_tokens[0]
             if candidate_document != "-":
                 document_number = candidate_document
+            post_channel_tokens = post_channel_tokens[1:]
+
+        amount_positions = [
+            index for index, token in enumerate(post_channel_tokens)
+            if self._is_amount_token(token)
+        ]
+
+        if len(amount_positions) < 3:
+            return None
+
+        charge_token = post_channel_tokens[amount_positions[0]]
+        deposit_token = post_channel_tokens[amount_positions[1]]
+        balance_token = post_channel_tokens[amount_positions[2]]
+        continuation_tokens = post_channel_tokens[amount_positions[2] + 1:]
+
+        description = self._clean_text(" ".join([*description_tokens, *continuation_tokens]))
+        branch = channel_value
 
         charge_amount = self._parse_amount(charge_token)
         deposit_amount = self._parse_amount(deposit_token)
@@ -425,15 +463,48 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
 
         return None
 
-    def _resolve_year_from_page(self, page_text: str) -> int:
-        period_match = re.search(
-            r"(\d{2}/\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})",
-            page_text,
-            re.IGNORECASE,
+    def _looks_like_new_format_description_prefix(self, line: str) -> bool:
+        upper_line = self._clean_text(line).upper()
+        return upper_line.startswith(
+            (
+                "TRASPASO ",
+                "PAGO:",
+                "PAGO ",
+                "CARGO ",
+                "ABONO ",
+                "GIRO ",
+                "COMISION ",
+                "REGULARIZACION ",
+                "IMPUESTO ",
+                "INTERESES ",
+                "PRIMA ",
+                "CPC.",
+            )
         )
-        if period_match:
-            return datetime.strptime(period_match.group(2), "%d/%m/%Y").year
+
+    def _resolve_year_from_page(self, page_text: str) -> int:
+        period = self._extract_period(page_text)
+        if period:
+            return period[1].year
         return datetime.now().year
+
+    @staticmethod
+    def _extract_period(page_text: str):
+        patterns = [
+            r"DESDE\s*:\s*(\d{2}/\d{2}/\d{4})\s+HASTA\s*:\s*(\d{2}/\d{2}/\d{4})",
+            r"Movimientos\s+desde\s+(\d{2}/\d{2}/\d{4})\s+al\s+(\d{2}/\d{2}/\d{4})",
+            r"(\d{2}/\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})",
+        ]
+
+        for pattern in patterns:
+            period_match = re.search(pattern, page_text, re.IGNORECASE)
+            if period_match:
+                return (
+                    datetime.strptime(period_match.group(1), "%d/%m/%Y").date(),
+                    datetime.strptime(period_match.group(2), "%d/%m/%Y").date(),
+                )
+
+        return None
 
     def _extract_table_lines(self, page_text: str) -> list[str]:
         page_lines = [self._clean_text(line) for line in page_text.splitlines() if self._clean_text(line)]
@@ -741,10 +812,16 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
     def _detect_movement_type(self, description: str) -> str:
         description_upper = description.upper()
 
-        if "TRASPASO A:" in description_upper or "TRASPASO A CUENTA:" in description_upper:
+        if (
+            "TRASPASO A:" in description_upper
+            or re.search(r"\bTRASPASO\s+A\s+CUENTA:?\s*\d+", description_upper)
+        ):
             return "TRANSFER_OUT"
 
-        if "TRASPASO DE:" in description_upper or "TRASPASO DE CUENTA:" in description_upper:
+        if (
+            "TRASPASO DE:" in description_upper
+            or re.search(r"\bTRASPASO\s+DE\s+CUENTA:?\s*\d+", description_upper)
+        ):
             return "TRANSFER_IN"
 
         if "ABONO SEGUN INSTRUC." in description_upper:

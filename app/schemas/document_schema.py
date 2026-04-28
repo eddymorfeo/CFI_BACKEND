@@ -15,6 +15,7 @@ class SourceDocumentResponse(BaseModel):
     processing_status: str
     review_status: str
     source_origin: str
+    extracted_movements_count: int = 0
 
     detected_institution_name: str | None = None
     detected_document_group: str | None = None
@@ -36,6 +37,7 @@ class SourceDocumentDetailResponse(BaseModel):
     processing_status: str
     review_status: str
     source_origin: str
+    extracted_movements_count: int = 0
 
     detected_institution_name: str | None = None
     detected_holder_name: str | None = None

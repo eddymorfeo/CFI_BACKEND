@@ -1,6 +1,6 @@
 import pdfplumber
 
-with pdfplumber.open("Cuenta Fan Ahorro Chile.pdf") as pdf:
+with pdfplumber.open("CC Andrea Sanhueza OK.pdf") as pdf:
     for page_num in range(min(3, len(pdf.pages))):  # Primeras 3 páginas
         page = pdf.pages[page_num]
         text = page.extract_text()

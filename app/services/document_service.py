@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import UploadFile, status
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -57,6 +58,12 @@ class DocumentService:
             .all()
         )
 
+        document_ids = [document.source_document_id for document in documents]
+        movements_count_by_document_id = DocumentService._count_extracted_movements_by_document_id(
+            database=database,
+            source_document_ids=document_ids,
+        )
+
         response = []
         for document in documents:
             parser_code = getattr(document, "parser_code", None)
@@ -73,6 +80,10 @@ class DocumentService:
                     "processing_status": document.processing_status,
                     "review_status": document.review_status,
                     "source_origin": document.source_origin,
+                    "extracted_movements_count": movements_count_by_document_id.get(
+                        document.source_document_id,
+                        0,
+                    ),
                     "detected_institution_name": getattr(document, "detected_institution_name", None),
                     "detected_document_group": DocumentClassifierService.detect_document_group(parser_code),
                     "detected_document_type": DocumentClassifierService.detect_document_type(parser_code),
@@ -97,6 +108,11 @@ class DocumentService:
             )
 
         parser_code = getattr(document, "parser_code", None)
+        extracted_movements_count = (
+            database.query(func.count(ExtractedMovement.extracted_movement_id))
+            .filter(ExtractedMovement.source_document_id == source_document_id)
+            .scalar()
+        )
 
         return {
             "source_document_id": document.source_document_id,
@@ -110,6 +126,7 @@ class DocumentService:
             "processing_status": document.processing_status,
             "review_status": document.review_status,
             "source_origin": document.source_origin,
+            "extracted_movements_count": extracted_movements_count or 0,
             "detected_institution_name": getattr(document, "detected_institution_name", None),
             "detected_holder_name": getattr(document, "detected_holder_name", None),
             "detected_account_number": getattr(document, "detected_account_number", None),
@@ -150,3 +167,26 @@ class DocumentService:
                 pass
 
         return {"message": "Documento eliminado correctamente."}
+
+    @staticmethod
+    def _count_extracted_movements_by_document_id(
+        database: Session,
+        source_document_ids,
+    ) -> dict:
+        if not source_document_ids:
+            return {}
+
+        rows = (
+            database.query(
+                ExtractedMovement.source_document_id,
+                func.count(ExtractedMovement.extracted_movement_id),
+            )
+            .filter(ExtractedMovement.source_document_id.in_(source_document_ids))
+            .group_by(ExtractedMovement.source_document_id)
+            .all()
+        )
+
+        return {
+            source_document_id: movements_count
+            for source_document_id, movements_count in rows
+        }

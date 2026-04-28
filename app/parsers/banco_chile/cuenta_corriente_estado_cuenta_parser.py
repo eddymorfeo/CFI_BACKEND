@@ -1,816 +1,657 @@
+"""
+Parser para Estado de Cuenta Corriente - Banco de Chile
+Soporta 3 formatos:
+  - CLASSIC (coma)  : montos con coma  → 6,951,835  (PDFs históricos)
+  - CLASSIC (punto) : montos con punto → 111.625    (PDFs nuevos 2025+)
+  - NEW_FORMAT      : tabla web        → columnas separadas (descarga online)
+
+Estrategia de extracción:
+  - NEW_FORMAT : texto plano, último 3 tokens son cargo/abono/saldo (ya separados)
+  - CLASSIC    : texto plano para descripción+sucursal+monto, tipo de movimiento
+                 determina cargo vs abono (la cartola NO distingue en texto plano)
+"""
+
 import re
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 import pdfplumber
 
-from app.parsers.base_parser import BaseParser
+try:
+    from app.parsers.base_parser import BaseParser
+except ImportError:
+    class BaseParser:
+        def validate_file_exists(self, file_path: str):
+            from pathlib import Path
+            p = Path(file_path)
+            if not p.exists():
+                raise FileNotFoundError(file_path)
+            return p
 
+
+# ─── Constantes ──────────────────────────────────────────────────────────────
+
+_DATE_MM_RE       = re.compile(r"^\d{2}/\d{2}$")
+_DATE_DDMMYYYY_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+_AMOUNT_RE        = re.compile(r"^\d{1,3}(?:[.,]\d{3})*$")
+_DOCUMENT_NUM_RE  = re.compile(r"^\d{7,}$")
+
+_CLASSIC_BRANCHES = [
+    "OFICINA LOS ANDES SERVICIO AL",
+    "OFICINA SAN FELIPE SERVICIO AL",
+    "OFICINA CENTRAL (SB)",
+    "OFICINA CENTRAL",
+    "OF. SAN FELIPE",
+    "OF. LOS ANDES",
+    "OF. BAN",
+    "OF. SAN",
+    "INTERNET",
+    "CENTRAL",
+    "BANCA MOVIL",
+]
+
+_NEW_FORMAT_CHANNELS = ["Oficina Central", "San Felipe", "Internet", "Banca Movil"]
+
+# Tipos de movimiento que son ABONOS (entradas de dinero)
+_CREDIT_TYPES = frozenset({
+    "TRANSFER_IN",
+    "DEPOSIT",
+    "REFUND",
+    "CREDIT_LINE_TRANSFER_IN",
+    "SALARY_PAYMENT",
+})
+
+# Tipos que son CARGOS especiales (salidas que el banco puede poner en col abono)
+# En el formato clásico la columna "MONTO DEPOSITOS O ABONOS" incluye:
+# - ABONO POR CAPTACIONES → DEPOSIT
+# - TRASPASO DE: → TRANSFER_IN
+# - PAGO:DE SUELDOS → SALARY_PAYMENT
+# - DEP.CHEQ.OTROS BANCOS → DEPOSIT
+# Resto → CARGO
+
+
+# ─── Parser principal ─────────────────────────────────────────────────────────
 
 class BancoChileCuentaCorrienteEstadoCuentaParser(BaseParser):
-    DATE_MM_PATTERN = re.compile(r"^\d{2}/\d{2}$")
-    DATE_DDMMYYYY_PATTERN = re.compile(r"^\d{2}/\d{2}/\d{4}$")
-    DATE_PREFIX_PATTERN = re.compile(r"^(?P<date>\d{2}/\d{2})\s+(?P<body>.+)$")
-    DATE_FULL_PREFIX_PATTERN = re.compile(r"^(?P<date>\d{2}/\d{2}/\d{4})\s+(?P<body>.+)$")
-    DOCUMENT_NUMBER_PATTERN = re.compile(r"^\d{7,}$")
 
-    BRANCH_OPTIONS = [
-        "OFICINA LOS ANDES SERVICIO AL",
-        "OFICINA SAN FELIPE SERVICIO AL",
-        "OFICINA CENTRAL (SB)",
-        "OFICINA CENTRAL",
-        "OF. SAN FELIPE",
-        "OF. SAN",
-        "OF. BAN",
-        "INTERNET",
-        "CENTRAL",
-        "BANCA MOVIL",
-    ]
-
-    NEW_FORMAT_CHANNEL_OPTIONS = [
-        "Oficina Central",
-        "San Felipe",
-        "Internet",
-        "Banca Movil",
-    ]
-
-    HEADER_STOP_LINES = {
-        "DIA/MES",
-        "DIA/ME",
-        "SUCURSAL",
-        "N° DOCTO",
-        "MONTO CHEQUES",
-        "O CARGOS",
-        "MONTO DEPOSITOS",
-        "O ABONOS",
-        "SALDO",
-        "CHEQUES",
-        "DEPOSITOS",
-        "OTROS ABONOS",
-        "OTROS CARGOS",
-        "GIROS CAJERO AUTOMATICO",
-        "IMPUESTOS",
-    }
-
-    NEW_FORMAT_HEADER_STOP_LINES = {
-        "FECHA",
-        "DESCRIPCIÓN",
-        "DESCRIPCION",
-        "CANAL O",
-        "SUCURSAL",
-        "Nº DOCUMENTO",
-        "N° DOCUMENTO",
-        "CARGOS (CLP)",
-        "ABONOS (CLP)",
-        "SALDO (CLP)",
-    }
+    # ── Detección ─────────────────────────────────────────────────────────────
 
     def can_parse(self, file_path: str) -> bool:
         path = self.validate_file_exists(file_path)
-
         if path.suffix.lower() != ".pdf":
             return False
-
         with pdfplumber.open(path) as pdf:
-            first_page_text = pdf.pages[0].extract_text() or ""
+            page_texts = [page.extract_text() or "" for page in pdf.pages]
 
-        normalized_text = self._clean_text(first_page_text).upper()
+        normalized_pages = [self._clean(text).upper() for text in page_texts]
+        normalized_document = "\n".join(normalized_pages)
 
-        has_classic_format = (
-            "ESTADO DE CUENTA" in normalized_text
-            and "CUENTA CORRIENTE" in normalized_text
-            and "DETALLE DE TRANSACCION" in normalized_text
-            and "N° DOCTO" in normalized_text
-        )
+        if "CUENTA VISTA" in normalized_document and "CUENTA CORRIENTE" not in normalized_document:
+            return False
 
-        has_new_format = (
-            "SALDO Y MOVIMIENTOS DE CUENTA" in normalized_text
-            and "MOVIMIENTOS DESDE" in normalized_text
-            and ("Nº DOCUMENTO" in normalized_text or "N° DOCUMENTO" in normalized_text)
-            and "CARGOS (CLP)" in normalized_text
-            and "ABONOS (CLP)" in normalized_text
-            and "SALDO (CLP)" in normalized_text
-        )
+        if "CUENTA CORRIENTE" not in normalized_document:
+            return False
 
-        return has_classic_format or has_new_format
+        return any(self._detect_format(text) != "UNKNOWN" for text in normalized_pages)
+
+    @staticmethod
+    def _detect_format(upper_text: str) -> str:
+        if "SALDO Y MOVIMIENTOS DE CUENTA" in upper_text and "CARGOS (CLP)" in upper_text:
+            return "NEW_FORMAT"
+        if (
+            "FECHA" in upper_text
+            and "DESCRIP" in upper_text
+            and "CARGOS (CLP)" in upper_text
+            and "ABONOS (CLP)" in upper_text
+            and "SALDO (CLP)" in upper_text
+            and ("CANAL" in upper_text or "SUCURSAL" in upper_text)
+        ):
+            return "NEW_FORMAT"
+        if "ESTADO DE CUENTA" in upper_text and "DETALLE DE TRANSACCION" in upper_text:
+            return "CLASSIC"
+        return "UNKNOWN"
+
+    # ── Punto de entrada ──────────────────────────────────────────────────────
 
     def parse(self, file_path: str) -> dict:
         path = self.validate_file_exists(file_path)
-
         with pdfplumber.open(path) as pdf:
-            pages = []
-            for page_index, page in enumerate(pdf.pages):
-                pages.append(
-                    {
-                        "page_number": page_index + 1,
-                        "text": page.extract_text() or "",
-                    }
-                )
+            pages_data = []
+            for i, page in enumerate(pdf.pages):
+                pages_data.append({
+                    "page_number": i + 1,
+                    "text": page.extract_text() or "",
+                    "words": page.extract_words(x_tolerance=3, y_tolerance=3),
+                })
 
-        document_metadata = self._extract_metadata(pages)
-        movements = self._extract_movements(pages)
+        metadata  = self._extract_metadata(pages_data)
+        movements = self._extract_movements(pages_data)
 
         return {
             "parser_code": "BANCO_CHILE_CUENTA_CORRIENTE_ESTADO_CUENTA",
             "document_metadata": {
-                **document_metadata,
+                **metadata,
                 "detected_statement_type": "CUENTA_CORRIENTE",
             },
             "movements": movements,
         }
 
-    def _extract_metadata(self, pages: list[dict]) -> dict:
-        first_page_text = pages[0]["text"]
-        normalized_first_page_text = self._clean_text(first_page_text)
+    # ── Metadatos ─────────────────────────────────────────────────────────────
 
-        account_match = re.search(
-            r"N° DE CUENTA\s*:\s*(\d+)",
-            first_page_text,
-            re.IGNORECASE,
-        )
+    def _extract_metadata(self, pages_data: list[dict]) -> dict:
+        first_text = pages_data[0]["text"]
+        clean = self._clean(first_text)
 
-        account_match_value = None
-        if account_match:
-            account_match_value = account_match.group(1)
+        account = None
+        m = re.search(r"N°\s*DE\s*CUENTA\s*:\s*(\d+)", first_text, re.IGNORECASE)
+        if m:
+            account = m.group(1)
         else:
-            dashed_account_match = re.search(
-                r"\b\d{2}-\d{3}-\d{5}-\d{2}\b",
-                normalized_first_page_text,
-            )
-            if dashed_account_match:
-                account_match_value = re.sub(r"\D", "", dashed_account_match.group(0))
+            m = re.search(r"\b(\d{2}-\d{3}-\d{5}-\d{2})\b", clean)
+            if m:
+                account = re.sub(r"\D", "", m.group(1))
+            else:
+                m = re.search(r"Cuenta\s+([\d-]+)", first_text, re.IGNORECASE)
+                if m:
+                    account = re.sub(r"\D", "", m.group(1))
 
-        period_match = re.search(
-            r"(\d{2}/\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})",
-            first_page_text,
-            re.IGNORECASE,
-        )
+        date_from = date_to = None
+        for pg in pages_data:
+            period = self._extract_period(pg["text"])
+            if period:
+                date_from, date_to = period
+                break
 
-        if not period_match:
-            period_match = re.search(
-                r"Movimientos desde (\d{2}/\d{2}/\d{4}) al (\d{2}/\d{2}/\d{4})",
-                normalized_first_page_text,
-                re.IGNORECASE,
-            )
+        holder = self._extract_holder(first_text)
 
-        holder_name = self._extract_holder_name(first_page_text)
-
-        available_balance_match = re.search(
-            r"Saldo Disponible\s+([\d\.,]+)",
-            normalized_first_page_text,
-            re.IGNORECASE,
-        )
-        accounting_balance_match = re.search(
-            r"Saldo Contable\s+([\d\.,]+)",
-            normalized_first_page_text,
-            re.IGNORECASE,
-        )
-        total_charges_match = re.search(
-            r"Total Cargos\s+([\d\.,]+)",
-            normalized_first_page_text,
-            re.IGNORECASE,
-        )
-        total_credits_match = re.search(
-            r"Total Abonos\s+([\d\.,]+)",
-            normalized_first_page_text,
-            re.IGNORECASE,
-        )
+        def _bal(pattern: str):
+            mm = re.search(pattern, clean, re.IGNORECASE)
+            return self._parse_amount(mm.group(1)) if mm else None
 
         return {
             "detected_institution_name": "Banco de Chile",
-            "detected_holder_name": holder_name,
-            "detected_account_number": account_match_value,
-            "document_date_from": datetime.strptime(period_match.group(1), "%d/%m/%Y").date() if period_match else None,
-            "document_date_to": datetime.strptime(period_match.group(2), "%d/%m/%Y").date() if period_match else None,
-            "detected_available_balance": self._parse_amount(available_balance_match.group(1)) if available_balance_match else None,
-            "detected_accounting_balance": self._parse_amount(accounting_balance_match.group(1)) if accounting_balance_match else None,
-            "detected_total_charges": self._parse_amount(total_charges_match.group(1)) if total_charges_match else None,
-            "detected_total_credits": self._parse_amount(total_credits_match.group(1)) if total_credits_match else None,
+            "detected_holder_name": holder,
+            "detected_account_number": account,
+            "document_date_from": date_from,
+            "document_date_to": date_to,
+            "detected_available_balance": _bal(r"Saldo\s+Disponible\s+([\d.,]+)"),
+            "detected_accounting_balance": _bal(r"Saldo\s+Contable\s+([\d.,]+)"),
+            "detected_total_charges": _bal(r"Total\s+Cargos\s+([\d.,]+)"),
+            "detected_total_credits": _bal(r"Total\s+Abonos\s+([\d.,]+)"),
         }
 
-    def _extract_holder_name(self, page_text: str) -> str | None:
-        sr_match = re.search(
-            r"Sr\(a\)\.:\s*(.*?)\s+Rut\.:",
-            page_text,
-            re.IGNORECASE | re.DOTALL,
-        )
-        if sr_match:
-            return self._clean_text(sr_match.group(1))
-
-        lines = [self._clean_text(line) for line in page_text.splitlines() if self._clean_text(line)]
-
-        ignored_markers = [
-            "ESTADO DE CUENTA",
-            "CUENTA CORRIENTE",
-            "N° DE CUENTA",
-            "MONEDA",
-            "EJECUTIVO DE CUENTA",
-            "SUCURSAL",
-            "TELEFONO",
-            "CARTOLA N°",
-            "DESDE",
-            "HASTA",
-            "N° DE PAGINA",
-            "FECHA",
-            "DETALLE DE TRANSACCION",
-            "LINEA DE CREDITO",
-            "RETENCION",
-            "SALDO DISPONIBLE",
-            "APROBADO",
-            "UTILIZADO",
-            "DISPONIBLE",
-            "VENCIMIENTO",
-            "SALDO Y MOVIMIENTOS DE CUENTA",
-            "MOVIMIENTOS DESDE",
-            "Nº DOCUMENTO",
-            "N° DOCUMENTO",
-            "CARGOS (CLP)",
-            "ABONOS (CLP)",
-            "SALDO (CLP)",
-        ]
-
-        for line in lines:
-            upper_line = line.upper()
-            if "@" in line:
-                continue
-            if any(marker in upper_line for marker in ignored_markers):
-                continue
-            if re.fullmatch(r"\d{8,}", line):
-                continue
-            if re.fullmatch(r"\d{2}-\d{3}-\d{5}-\d{2}", line):
-                continue
-            if len(line.split()) >= 2:
-                return line.strip()
-
+    @staticmethod
+    def _extract_holder(text: str) -> str | None:
+        # Nuevo formato: "Sr(a).: Nombre  Rut.:"
+        m = re.search(r"Sr\(a\)\.\s*:\s*(.*?)\s+Rut\.", text, re.IGNORECASE | re.DOTALL)
+        if m:
+            return " ".join(m.group(1).split())
+        # Formato clásico: SR(A)(ES) en una línea, nombre en la línea siguiente
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if "SR(A)(ES)" in line.upper():
+                for j in range(i + 1, min(i + 5, len(lines))):
+                    candidate = lines[j].strip()
+                    if candidate and not any(kw in candidate.upper() for kw in [
+                        "APROBADO", "UTILIZADO", "DISPONIBLE", "VENCIMIENTO",
+                        "@", "EJECUTIVO", "SUCURSAL", "TELEFONO", "LINEA DE CREDITO",
+                    ]):
+                        return " ".join(candidate.split())
+                break
         return None
 
-    def _extract_movements(self, pages: list[dict]) -> list[dict]:
+    # ── Movimientos ───────────────────────────────────────────────────────────
+
+    def _extract_movements(self, pages_data: list[dict]) -> list[dict]:
         movements: list[dict] = []
         row_number = 1
 
-        for page_info in pages:
-            page_number = page_info["page_number"]
-            page_text = page_info["text"]
-
-            if self._is_new_format_page(page_text):
-                new_format_rows = self._extract_new_format_rows(page_text)
-
-                for row_text in new_format_rows:
-                    movement = self._parse_new_format_row(
-                        row_text=row_text,
-                        row_number=row_number,
-                        page_number=page_number,
-                    )
-                    if movement is not None:
-                        movements.append(movement)
-                        row_number += 1
+        for page in pages_data:
+            fmt = self._detect_format(self._clean(page["text"]).upper())
+            if fmt == "NEW_FORMAT":
+                rows = self._parse_new_format_page(page)
+            elif fmt == "CLASSIC":
+                rows = self._parse_classic_page(page)
+            else:
                 continue
 
-            year = self._resolve_year_from_page(page_text)
-            table_lines = self._extract_table_lines(page_text)
-            merged_rows = self._merge_multiline_rows(table_lines)
-
-            for merged_row in merged_rows:
-                movement = self._parse_row(
-                    row_text=merged_row,
-                    row_number=row_number,
-                    page_number=page_number,
-                    year=year,
-                )
-                if movement is not None:
-                    movements.append(movement)
-                    row_number += 1
+            for mv in rows:
+                mv["row_number"]  = row_number
+                mv["page_number"] = page["page_number"]
+                movements.append(mv)
+                row_number += 1
 
         return movements
 
-    def _is_new_format_page(self, page_text: str) -> bool:
-        normalized_text = self._clean_text(page_text).upper()
-        return (
-            "SALDO Y MOVIMIENTOS DE CUENTA" in normalized_text
-            and "MOVIMIENTOS DESDE" in normalized_text
-            and ("Nº DOCUMENTO" in normalized_text or "N° DOCUMENTO" in normalized_text)
-            and "CARGOS (CLP)" in normalized_text
-            and "ABONOS (CLP)" in normalized_text
-            and "SALDO (CLP)" in normalized_text
-        )
+    # ─── Nuevo formato (web) ──────────────────────────────────────────────────
 
-    def _extract_new_format_rows(self, page_text: str) -> list[str]:
-        page_lines = [self._clean_text(line) for line in page_text.splitlines() if self._clean_text(line)]
-
-        relevant_rows: list[str] = []
+    def _parse_new_format_page(self, page: dict) -> list[dict]:
+        lines    = [self._clean(l) for l in page["text"].splitlines() if self._clean(l)]
+        rows: list[dict] = []
         in_table = False
+        current_line: str | None = None
+        pending_description_prefix: str | None = None
 
-        for line in page_lines:
-            line_upper = line.upper()
+        def flush_current_line():
+            nonlocal current_line
+            if current_line:
+                mv = self._parse_new_format_line(current_line)
+                if mv:
+                    rows.append(mv)
+                current_line = None
 
-            if not in_table and "FECHA" in line_upper and "DESCRIP" in line_upper:
-                in_table = True
-                continue
-
+        for line in lines:
+            upper = line.upper()
             if not in_table:
+                if "FECHA" in upper and "DESCRIP" in upper:
+                    in_table = True
                 continue
-
-            if "INFÓRMESE SOBRE LA GARANTÍA ESTATAL" in line_upper or "INFORMESE SOBRE LA GARANTIA ESTATAL" in line_upper:
+            if "INFORMESE" in upper or "INFÓRMESE" in upper:
                 break
-
-            if line_upper in self.NEW_FORMAT_HEADER_STOP_LINES:
+            if "CARGOS (CLP)" in upper or "ABONOS (CLP)" in upper or "SALDO (CLP)" in upper:
+                continue
+            if len(line) >= 10 and _DATE_DDMMYYYY_RE.fullmatch(line[:10]):
+                flush_current_line()
+                if pending_description_prefix:
+                    current_line = f"{line[:10]} {pending_description_prefix} {line[10:].strip()}"
+                    pending_description_prefix = None
+                else:
+                    current_line = line
                 continue
 
-            if "Nº DOCUMENTO" in line_upper or "N° DOCUMENTO" in line_upper:
+            if current_line:
+                if self._looks_like_new_format_description_prefix(line):
+                    flush_current_line()
+                    pending_description_prefix = line
+                    continue
+
+                current_line = f"{current_line} {line}"
                 continue
 
-            if "CARGOS (CLP)" in line_upper or "ABONOS (CLP)" in line_upper or "SALDO (CLP)" in line_upper:
-                continue
+            if pending_description_prefix:
+                pending_description_prefix = f"{pending_description_prefix} {line}"
+            else:
+                pending_description_prefix = line
 
-            if len(line) >= 10 and self.DATE_DDMMYYYY_PATTERN.fullmatch(line[:10]):
-                relevant_rows.append(line)
+        flush_current_line()
+        return rows
 
-        return relevant_rows
-
-    def _parse_new_format_row(
-        self,
-        row_text: str,
-        row_number: int,
-        page_number: int,
-    ) -> dict | None:
-        row_text = self._clean_text(row_text)
-
-        date_match = self.DATE_FULL_PREFIX_PATTERN.match(row_text)
-        if not date_match:
+    def _parse_new_format_line(self, line: str) -> dict | None:
+        tokens = line.split()
+        if len(tokens) < 6:
+            return None
+        try:
+            txn_date = datetime.strptime(tokens[0], "%d/%m/%Y").date()
+        except ValueError:
             return None
 
-        transaction_date = datetime.strptime(date_match.group("date"), "%d/%m/%Y").date()
-        body = date_match.group("body").strip()
-
-        tokens = body.split()
-        if len(tokens) < 5:
+        body = tokens[1:]
+        if len(body) < 5:
             return None
 
-        charge_token = tokens[-3]
-        deposit_token = tokens[-2]
-        balance_token = tokens[-1]
-
-        if not self._is_amount_token(charge_token):
-            return None
-        if not self._is_amount_token(deposit_token):
-            return None
-        if not self._is_amount_token(balance_token):
-            return None
-
-        header_tokens = tokens[:-3]
-        if len(header_tokens) < 2:
-            return None
-
-        channel_match = self._find_new_format_channel(header_tokens)
+        channel_match = self._find_new_channel(body)
         if channel_match is None:
             return None
 
-        channel_start_index, channel_token_count, channel_value = channel_match
+        ch_start, ch_count, channel = channel_match
+        desc_tokens = body[:ch_start]
+        post_tokens = body[ch_start + ch_count:]
 
-        description_tokens = header_tokens[:channel_start_index]
-        post_channel_tokens = header_tokens[channel_start_index + channel_token_count :]
-
-        if not description_tokens:
+        if not desc_tokens:
             return None
 
-        description = self._clean_text(" ".join(description_tokens))
-        branch = channel_value
+        doc_num = None
+        if post_tokens and not self._is_amount(post_tokens[0]):
+            if post_tokens[0] != "-":
+                doc_num = post_tokens[0]
+            post_tokens = post_tokens[1:]
 
-        document_number = None
-        if post_channel_tokens:
-            candidate_document = post_channel_tokens[0]
-            if candidate_document != "-":
-                document_number = candidate_document
+        amount_positions = [
+            index for index, token in enumerate(post_tokens)
+            if self._is_amount(token)
+        ]
 
-        charge_amount = self._parse_amount(charge_token)
-        deposit_amount = self._parse_amount(deposit_token)
-        balance_amount = self._parse_amount(balance_token)
+        if len(amount_positions) < 3:
+            return None
 
-        detected_movement_type = self._detect_movement_type(description)
-        is_transfer_candidate = detected_movement_type in {"TRANSFER_IN", "TRANSFER_OUT"}
+        t_cargo = post_tokens[amount_positions[0]]
+        t_abono = post_tokens[amount_positions[1]]
+        t_saldo = post_tokens[amount_positions[2]]
+        continuation_tokens = post_tokens[amount_positions[2] + 1:]
+
+        description = " ".join([*desc_tokens, *continuation_tokens])
+
+        charge  = self._parse_amount(t_cargo)
+        deposit = self._parse_amount(t_abono)
+        balance = self._parse_amount(t_saldo)
+        mtype   = self._detect_movement_type(description)
 
         return {
-            "row_number": row_number,
-            "page_number": page_number,
-            "transaction_date": transaction_date,
-            "branch": branch,
+            "transaction_date": txn_date,
+            "branch": channel,
             "description": description,
-            "document_number": document_number,
-            "charge_amount": charge_amount,
-            "deposit_amount": deposit_amount,
-            "balance_amount": balance_amount,
-            "raw_row_text": row_text,
+            "document_number": doc_num,
+            "charge_amount": charge,
+            "deposit_amount": deposit,
+            "balance_amount": balance,
+            "raw_row_text": line,
             "raw_row_json": {
-                "page_number": page_number,
                 "source_format": "BANCO_CHILE_CUENTA_CORRIENTE_NEW_FORMAT",
                 "parsed_columns": {
-                    "description": description,
-                    "branch": branch,
-                    "document_number": document_number,
-                    "charge_amount": str(charge_amount),
-                    "deposit_amount": str(deposit_amount),
-                    "balance_amount": str(balance_amount),
+                    "description": description, "branch": channel,
+                    "document_number": doc_num,
+                    "charge_amount": str(charge),
+                    "deposit_amount": str(deposit),
+                    "balance_amount": str(balance),
                 },
             },
-            "detected_movement_type": detected_movement_type,
-            "is_transfer_candidate": is_transfer_candidate,
+            "detected_movement_type": mtype,
+            "is_transfer_candidate": mtype in {"TRANSFER_IN", "TRANSFER_OUT"},
             "confidence_score": Decimal("0.99"),
         }
 
-    def _find_new_format_channel(self, tokens: list[str]) -> tuple[int, int, str] | None:
-        channel_variants = []
-        for channel_option in self.NEW_FORMAT_CHANNEL_OPTIONS:
-            channel_tokens = channel_option.split()
-            channel_variants.append((channel_tokens, channel_option))
-
-        channel_variants.sort(key=lambda item: len(item[0]), reverse=True)
-
-        for token_index in range(len(tokens)):
-            for channel_tokens, original_value in channel_variants:
-                token_slice = tokens[token_index : token_index + len(channel_tokens)]
-                if [token.upper() for token in token_slice] == [token.upper() for token in channel_tokens]:
-                    return token_index, len(channel_tokens), original_value
-
+    def _find_new_channel(self, tokens: list[str]) -> tuple[int, int, str] | None:
+        variants = sorted(
+            [(ch.split(), ch) for ch in _NEW_FORMAT_CHANNELS],
+            key=lambda x: len(x[0]),
+            reverse=True,
+        )
+        for i in range(len(tokens)):
+            for ch_tokens, original in variants:
+                sl = tokens[i: i + len(ch_tokens)]
+                if [t.upper() for t in sl] == [t.upper() for t in ch_tokens]:
+                    return i, len(ch_tokens), original
         return None
 
-    def _resolve_year_from_page(self, page_text: str) -> int:
-        period_match = re.search(
-            r"(\d{2}/\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})",
-            page_text,
-            re.IGNORECASE,
+    @staticmethod
+    def _looks_like_new_format_description_prefix(line: str) -> bool:
+        upper = " ".join(line.split()).upper()
+        return upper.startswith(
+            (
+                "TRASPASO ",
+                "PAGO:",
+                "PAGO ",
+                "CARGO ",
+                "ABONO ",
+                "GIRO ",
+                "COMISION ",
+                "REGULARIZACION ",
+                "IMPUESTO ",
+                "INTERESES ",
+                "PRIMA ",
+                "CPC.",
+            )
         )
-        if period_match:
-            return datetime.strptime(period_match.group(2), "%d/%m/%Y").year
-        return datetime.now().year
 
-    def _extract_table_lines(self, page_text: str) -> list[str]:
-        page_lines = [self._clean_text(line) for line in page_text.splitlines() if self._clean_text(line)]
+    # ─── Formato clásico (texto plano + lógica de tipo) ───────────────────────
 
-        relevant_lines: list[str] = []
+    def _parse_classic_page(self, page: dict) -> list[dict]:
+        """
+        Parsea una página de formato clásico usando texto plano.
+        La columna cargo/abono se determina por el tipo de movimiento
+        porque en el texto plano están aplanadas.
+        """
+        text   = page["text"]
+        period = self._extract_period(text)
+        lines  = [self._clean(l) for l in text.splitlines() if self._clean(l)]
+
         in_table = False
-
-        for line in page_lines:
-            line_upper = line.upper()
-
-            if "FECHA" in line_upper and "DETALLE DE TRANSACCION" in line_upper:
-                in_table = True
-                continue
-
-            if not in_table:
-                continue
-
-            if line_upper.startswith("RETENCION A 1 DIA"):
-                break
-
-            if "INFÓRMESE" in line_upper or "INFORMESE" in line_upper:
-                continue
-
-            if line_upper in self.HEADER_STOP_LINES:
-                continue
-
-            if re.fullmatch(r"0(?:\s+0)+", line_upper):
-                continue
-
-            relevant_lines.append(line)
-
-        return relevant_lines
-
-    def _merge_multiline_rows(self, lines: list[str]) -> list[str]:
-        merged_rows: list[str] = []
-        current_parts: list[str] = []
+        results: list[dict] = []
+        current_line: str | None = None
 
         for line in lines:
-            if self._starts_with_date(line):
-                if current_parts:
-                    merged_rows.append(" ".join(current_parts))
-                current_parts = [line]
+            upper = line.upper()
+
+            if not in_table:
+                if "DETALLE DE TRANSACCION" in upper and ("FECHA" in upper or "DIA" in upper):
+                    in_table = True
                 continue
 
-            if not current_parts:
+            if upper.startswith("RETENCION A 1 DIA"):
+                break
+            if "INFORMESE" in upper or "INFÓRMESE" in upper:
+                continue
+            if upper in {"DIA/MES", "DIA/ME", "SUCURSAL", "N° DOCTO",
+                         "MONTO CHEQUES", "O CARGOS", "MONTO DEPOSITOS", "O ABONOS", "SALDO",
+                         "CHEQUES", "DEPOSITOS", "OTROS ABONOS", "OTROS CARGOS",
+                         "GIROS CAJERO AUTOMATICO", "IMPUESTOS"}:
                 continue
 
-            current_parts.append(line)
+            # Línea de continuación ID:EXP
+            if line.upper().startswith("ID:EXP") or line.upper().startswith("ID:"):
+                if current_line:
+                    current_line = current_line  # ignorar ID:EXP
+                continue
 
-        if current_parts:
-            merged_rows.append(" ".join(current_parts))
+            # Nueva fila de transacción
+            if len(line) >= 5 and _DATE_MM_RE.fullmatch(line[:5]):
+                if current_line and "SALDO INICIAL" not in current_line.upper() and "SALDO FINAL" not in current_line.upper():
+                    mv = self._parse_classic_line(current_line, period)
+                    if mv:
+                        results.append(mv)
+                current_line = line
+                continue
 
-        return merged_rows
+            # Línea de continuación
+            if current_line:
+                if not self._looks_like_footer(line):
+                    current_line = current_line + " " + line
 
-    def _starts_with_date(self, line: str) -> bool:
-        if len(line) < 5:
-            return False
-        return bool(self.DATE_MM_PATTERN.fullmatch(line[:5]))
+        # Última línea pendiente
+        if current_line and "SALDO INICIAL" not in current_line.upper() and "SALDO FINAL" not in current_line.upper():
+            mv = self._parse_classic_line(current_line, period)
+            if mv:
+                results.append(mv)
 
-    def _parse_row(
-        self,
-        row_text: str,
-        row_number: int,
-        page_number: int,
-        year: int,
-    ) -> dict | None:
-        row_text = self._clean_text(row_text)
-        row_upper = row_text.upper()
+        return results
 
-        if "SALDO INICIAL" in row_upper or "SALDO FINAL" in row_upper:
+    def _parse_classic_line(self, line: str, period: tuple[date, date] | None) -> dict | None:
+        tokens = line.split()
+        if not tokens:
             return None
 
-        date_match = self.DATE_PREFIX_PATTERN.match(row_text)
-        if not date_match:
+        date_raw = tokens[0]
+        if not (len(date_raw) == 5 and _DATE_MM_RE.fullmatch(date_raw)):
             return None
 
-        date_raw = date_match.group("date")
-        body = date_match.group("body").strip()
+        body = tokens[1:]
 
-        parsed_columns = self._split_row_columns(body)
-        if parsed_columns is None:
+        # Buscar sucursal (más larga primero)
+        branch      = ""
+        desc_tokens: list[str] = []
+        trailing:   list[str] = []
+
+        for bp in sorted(_CLASSIC_BRANCHES, key=len, reverse=True):
+            bp_tokens = bp.split()
+            n         = len(bp_tokens)
+            for i in range(len(body) - n + 1):
+                if [t.upper() for t in body[i:i+n]] == [t.upper() for t in bp_tokens]:
+                    branch      = " ".join(body[i:i+n])  # usar el texto real (case original)
+                    desc_tokens = body[:i]
+                    trailing    = body[i+n:]
+                    break
+            if branch:
+                break
+
+        if not desc_tokens:
+            # Sin sucursal reconocida — ignorar
             return None
 
-        description = parsed_columns["description"]
-        branch = parsed_columns["branch"]
-        document_number = parsed_columns["document_number"]
-        charge_amount = parsed_columns["charge_amount"]
-        deposit_amount = parsed_columns["deposit_amount"]
-        balance_amount = parsed_columns["balance_amount"]
+        description = " ".join(desc_tokens)
 
-        detected_movement_type = self._detect_movement_type(description)
+        # Extraer número de documento y montos del trailing
+        doc_num: str | None = None
+        amounts: list[str] = []
 
-        if detected_movement_type in {"TRANSFER_IN", "DEPOSIT", "REFUND"} and charge_amount > 0 and deposit_amount == 0:
-            deposit_amount = charge_amount
-            charge_amount = Decimal("0")
+        j = 0
+        if j < len(trailing) and _DOCUMENT_NUM_RE.fullmatch(trailing[j]):
+            doc_num = trailing[j]
+            j += 1
 
-        if detected_movement_type in {"PURCHASE", "TRANSFER_OUT", "FEE", "WITHDRAWAL"} and deposit_amount > 0 and charge_amount == 0:
-            charge_amount = deposit_amount
-            deposit_amount = Decimal("0")
+        while j < len(trailing):
+            t = trailing[j]
+            if _AMOUNT_RE.fullmatch(t):
+                amounts.append(t)
+            j += 1
 
-        transaction_date = datetime.strptime(f"{date_raw}/{year}", "%d/%m/%Y").date()
-        is_transfer_candidate = detected_movement_type in {"TRANSFER_IN", "TRANSFER_OUT"}
+        if not amounts:
+            return None
+
+        # El primer monto es siempre el de la transacción
+        # El segundo (si existe) es el saldo de corte
+        txn_amount_str = amounts[0]
+        saldo_str      = amounts[1] if len(amounts) > 1 else None
+
+        txn_amount = self._parse_amount(txn_amount_str)
+        balance    = self._parse_amount(saldo_str) if saldo_str else Decimal("0")
+
+        mtype = self._detect_movement_type(description)
+
+        if mtype in _CREDIT_TYPES:
+            charge  = Decimal("0")
+            deposit = txn_amount
+        else:
+            charge  = txn_amount
+            deposit = Decimal("0")
+
+        txn_date = self._resolve_classic_date(date_raw, period)
+        row_text = self._clean(line)
 
         return {
-            "row_number": row_number,
-            "page_number": page_number,
-            "transaction_date": transaction_date,
+            "transaction_date": txn_date,
             "branch": branch,
             "description": description,
-            "document_number": document_number,
-            "charge_amount": charge_amount,
-            "deposit_amount": deposit_amount,
-            "balance_amount": balance_amount,
+            "document_number": doc_num,
+            "charge_amount": charge,
+            "deposit_amount": deposit,
+            "balance_amount": balance,
             "raw_row_text": row_text,
             "raw_row_json": {
-                "page_number": page_number,
-                "source_format": "BANCO_CHILE_CUENTA_CORRIENTE",
+                "source_format": "BANCO_CHILE_CUENTA_CORRIENTE_CLASSIC",
                 "parsed_columns": {
                     "description": description,
                     "branch": branch,
-                    "document_number": document_number,
-                    "charge_amount": str(charge_amount),
-                    "deposit_amount": str(deposit_amount),
-                    "balance_amount": str(balance_amount),
+                    "document_number": doc_num,
+                    "charge_amount": str(charge),
+                    "deposit_amount": str(deposit),
+                    "balance_amount": str(balance),
                 },
             },
-            "detected_movement_type": detected_movement_type,
-            "is_transfer_candidate": is_transfer_candidate,
+            "detected_movement_type": mtype,
+            "is_transfer_candidate": mtype in {"TRANSFER_IN", "TRANSFER_OUT"},
             "confidence_score": Decimal("0.98"),
         }
 
-    def _split_row_columns(self, body: str) -> dict | None:
-        tokens = body.split()
-        if len(tokens) < 2:
+    @staticmethod
+    def _looks_like_footer(line: str) -> bool:
+        n = " ".join(line.split())
+        if re.fullmatch(r"0(?:\s+0)+", n):
+            return True
+        if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})*(?:\s+\d{1,3}(?:[.,]\d{3})*)+", n):
+            return True
+        return False
+
+    # ── Utilidades ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_period(text: str) -> tuple[date, date] | None:
+        patterns = [
+            r"DESDE\s*:\s*(\d{2}/\d{2}/\d{4})\s+HASTA\s*:\s*(\d{2}/\d{2}/\d{4})",
+            r"Movimientos\s+desde\s+(\d{2}/\d{2}/\d{4})\s+al\s+(\d{2}/\d{2}/\d{4})",
+            r"(\d{2}/\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})",
+        ]
+
+        m = None
+        for pattern in patterns:
+            m = re.search(pattern, text, re.IGNORECASE)
+            if m:
+                break
+
+        if not m:
             return None
 
-        branch_match = self._find_branch(tokens)
-        if branch_match is None:
-            return None
-
-        branch_start_index, branch_token_count, branch_value = branch_match
-        if branch_start_index == 0:
-            return None
-
-        description_tokens = tokens[:branch_start_index]
-        trailing_tokens = tokens[branch_start_index + branch_token_count :]
-
-        description = self._clean_text(" ".join(description_tokens))
-        branch = branch_value
-
-        if not trailing_tokens:
-            return None
-
-        document_number = None
-        amount_tokens: list[str] = []
-        extra_tokens: list[str] = []
-
-        first_token = trailing_tokens[0]
-
-        if self.DOCUMENT_NUMBER_PATTERN.fullmatch(first_token) and len(trailing_tokens) >= 2:
-            document_number = first_token
-            remainder = trailing_tokens[1:]
-        else:
-            remainder = trailing_tokens
-
-        for token in remainder:
-            if self._is_amount_token(token):
-                amount_tokens.append(token)
-            else:
-                extra_tokens.append(token)
-
-        if not amount_tokens:
-            return None
-
-        embedded_document_number = self._extract_embedded_document_number(" ".join(extra_tokens))
-        if embedded_document_number and document_number is None:
-            document_number = embedded_document_number
-
-        description_suffix = self._build_description_suffix(extra_tokens)
-        if description_suffix:
-            description = self._clean_text(f"{description} {description_suffix}")
-
-        return self._resolve_amount_columns(
-            description=description,
-            branch=branch,
-            document_number=document_number,
-            amount_tokens=amount_tokens,
+        return (
+            datetime.strptime(m.group(1), "%d/%m/%Y").date(),
+            datetime.strptime(m.group(2), "%d/%m/%Y").date(),
         )
 
-    def _resolve_amount_columns(
-        self,
-        description: str,
-        branch: str,
-        document_number: str | None,
-        amount_tokens: list[str],
-    ) -> dict | None:
-        movement_type = self._detect_movement_type(description)
+    @staticmethod
+    def _resolve_classic_date(date_raw: str, period: tuple[date, date] | None) -> date:
+        day   = int(date_raw[:2])
+        month = int(date_raw[3:5])
+        if period is None:
+            return date(datetime.now().year, month, day)
+        start, end = period
+        if start.year == end.year:
+            year = start.year
+        else:
+            year = start.year if month >= start.month else end.year
+        return date(year, month, day)
 
-        if len(amount_tokens) == 1:
-            movement_amount = self._parse_amount(amount_tokens[0])
+    @staticmethod
+    def _is_amount(value: str) -> bool:
+        return bool(_AMOUNT_RE.fullmatch(value))
 
-            if movement_type in {"TRANSFER_IN", "DEPOSIT", "REFUND"}:
-                return {
-                    "description": description,
-                    "branch": branch,
-                    "document_number": document_number,
-                    "charge_amount": Decimal("0"),
-                    "deposit_amount": movement_amount,
-                    "balance_amount": Decimal("0"),
-                }
-
-            return {
-                "description": description,
-                "branch": branch,
-                "document_number": document_number,
-                "charge_amount": movement_amount,
-                "deposit_amount": Decimal("0"),
-                "balance_amount": Decimal("0"),
-            }
-
-        if len(amount_tokens) >= 2:
-            first_amount = self._parse_amount(amount_tokens[0])
-            second_amount = self._parse_amount(amount_tokens[1])
-
-            if len(amount_tokens) == 2:
-                if movement_type in {"TRANSFER_IN", "DEPOSIT", "REFUND"}:
-                    return {
-                        "description": description,
-                        "branch": branch,
-                        "document_number": document_number,
-                        "charge_amount": Decimal("0"),
-                        "deposit_amount": first_amount,
-                        "balance_amount": second_amount,
-                    }
-
-                return {
-                    "description": description,
-                    "branch": branch,
-                    "document_number": document_number,
-                    "charge_amount": first_amount,
-                    "deposit_amount": Decimal("0"),
-                    "balance_amount": second_amount,
-                }
-
-            third_amount = self._parse_amount(amount_tokens[2])
-
-            if first_amount == 0 and second_amount > 0:
-                return {
-                    "description": description,
-                    "branch": branch,
-                    "document_number": document_number,
-                    "charge_amount": Decimal("0"),
-                    "deposit_amount": second_amount,
-                    "balance_amount": third_amount,
-                }
-
-            if second_amount == 0 and first_amount > 0:
-                return {
-                    "description": description,
-                    "branch": branch,
-                    "document_number": document_number,
-                    "charge_amount": first_amount,
-                    "deposit_amount": Decimal("0"),
-                    "balance_amount": third_amount,
-                }
-
-            return {
-                "description": description,
-                "branch": branch,
-                "document_number": document_number,
-                "charge_amount": first_amount,
-                "deposit_amount": second_amount,
-                "balance_amount": third_amount,
-            }
-
-        return None
-
-    def _find_branch(self, tokens: list[str]) -> tuple[int, int, str] | None:
-        branch_variants = []
-        for branch_option in self.BRANCH_OPTIONS:
-            branch_tokens = branch_option.split()
-            branch_variants.append((branch_tokens, branch_option))
-
-        for token_index in range(len(tokens)):
-            for branch_tokens, original_value in branch_variants:
-                token_slice = tokens[token_index : token_index + len(branch_tokens)]
-                if [token.upper() for token in token_slice] == [token.upper() for token in branch_tokens]:
-                    return token_index, len(branch_tokens), original_value
-
-        return None
-
-    def _build_description_suffix(self, tokens: list[str]) -> str:
-        if not tokens:
-            return ""
-
-        suffix_tokens = []
-        for token in tokens:
-            if self.DOCUMENT_NUMBER_PATTERN.fullmatch(token):
-                continue
-            suffix_tokens.append(token)
-
-        return self._clean_text(" ".join(suffix_tokens))
-
-    def _extract_embedded_document_number(self, text: str) -> str | None:
-        candidates = re.findall(r"\b\d{7,}\b", text)
-        if not candidates:
-            return None
-        return candidates[0]
-
-    def _is_amount_token(self, value: str) -> bool:
-        cleaned_value = self._clean_text(value)
-        return bool(re.fullmatch(r"\d{1,3}(?:[.,]\d{3})*", cleaned_value))
-
-    def _parse_amount(self, value: str) -> Decimal:
-        cleaned_value = self._clean_text(str(value))
-        if not cleaned_value:
+    @staticmethod
+    def _parse_amount(value: str) -> Decimal:
+        if not value:
             return Decimal("0")
-
-        amount_match = re.search(r"\d{1,3}(?:[.,]\d{3})*", cleaned_value)
-        if not amount_match:
+        v = " ".join(str(value).split())
+        m = re.search(r"\d{1,3}(?:[.,]\d{3})*", v)
+        if not m:
             return Decimal("0")
+        return Decimal(m.group(0).replace(".", "").replace(",", ""))
 
-        normalized_amount = amount_match.group(0).replace(".", "").replace(",", "")
-        return Decimal(normalized_amount)
+    @staticmethod
+    def _clean(value: str) -> str:
+        return " ".join(str(value).split())
 
-    def _detect_movement_type(self, description: str) -> str:
-        description_upper = description.upper()
+    # ── Clasificación de movimientos ──────────────────────────────────────────
 
-        if "TRASPASO A:" in description_upper or "TRASPASO A CUENTA:" in description_upper:
+    @staticmethod
+    def _detect_movement_type(description: str) -> str:
+        u = description.upper()
+
+        if "TRASPASO A:" in u or re.search(r"\bTRASPASO\s+A\s+CUENTA:?\s*\d+", u):
             return "TRANSFER_OUT"
-
-        if "TRASPASO DE:" in description_upper or "TRASPASO DE CUENTA:" in description_upper:
+        if "TRASPASO DE:" in u or re.search(r"\bTRASPASO\s+DE\s+CUENTA:?\s*\d+", u):
             return "TRANSFER_IN"
-
-        if "ABONO POR CAPTACIONES" in description_upper:
+        if "ABONO POR CAPTACIONES" in u:
             return "DEPOSIT"
-
-        if "DEP.CHEQ.OTROS BANCOS" in description_upper:
+        if "DEP.CHEQ.OTROS BANCOS" in u or "DEPOSITO EN EFECTIVO" in u:
             return "DEPOSIT"
-
-        if "DEVOLUCION:" in description_upper:
+        if "TRANSFERENCIA DESDE LINEA DE CREDI" in u:
+            return "CREDIT_LINE_TRANSFER_IN"
+        if "PAGO:DE SUELDOS" in u or "PAGO DE SUELDOS" in u:
+            return "SALARY_PAYMENT"
+        if "DEVOLUCION:" in u:
             return "REFUND"
-
-        if "GIRO CAJERO AUTOMATICO" in description_upper:
+        if "PAGO:RETIRO PREVISIONAL" in u or "RETIRO PREVISIONAL" in u:
+            return "DEPOSIT"  # es entrada de dinero
+        if "CHEQUE DEPOSITADO DEVUELTO" in u:
+            return "PURCHASE"
+        if "GIRO CAJERO AUTOMATICO" in u:
             return "WITHDRAWAL"
-
-        if (
-            "CHEQUE DEPOSITADO DEVUELTO" in description_upper
-            or "CARGO POR PAGO TC" in description_upper
-            or "CARGO POR CAPTACIONES" in description_upper
-            or "PAGO:" in description_upper
-            or "PAGO TARJETA DE CREDITO" in description_upper
-            or "PAGO LINEA DE CRED" in description_upper
-            or "PAGO EN SERVIPAG" in description_upper
-            or "PAGO EN TESORERIA" in description_upper
-            or "PAGO:DE SUELDOS" in description_upper
-            or "PAGO:PROVEEDORES" in description_upper
-            or "PAGO SERVICIO" in description_upper
-            or "PAGO SERVICIO EN INTERNET" in description_upper
-            or "PAGO SERVICIO EN MI BANCO" in description_upper
-            or "INTERESES LINEA DE CREDITO" in description_upper
-            or "IMPUESTO LINEA DE CREDITO" in description_upper
-            or "PRIMA SEGURO DESGRAVAMEN" in description_upper
-            or "APORTE TELETON" in description_upper
-            or "RECAUDACION Y PAGOS DE SERVICIOS" in description_upper
-        ):
+        if any(kw in u for kw in [
+            "CARGO POR PAGO TC",
+            "CARGO POR CAPTACIONES",
+            "CARGO POR CAPTACION",
+            "PAGO AUTOMATICO TARJETA DE CREDITO",
+            "PAGO TARJETA DE CREDITO",
+            "PAGO LINEA DE CRED",
+            "PAGO EN SERVIPAG",
+            "PAGO EN SII.CL",
+            "PAGO EN TESORERIA",
+            "PAGO SERVICIO EN INTERNET",
+            "PAGO SERVICIO EN MI BANCO",
+            "INTERESES LINEA DE CREDITO",
+            "IMPUESTO LINEA DE CREDITO",
+            "PRIMA SEGURO DESGRAVAMEN",
+            "APORTE TELETON",
+            "RECAUDACION Y PAGOS DE SERVICIOS",
+            "COMISION ADMIN.",
+            "CPC.TRASP FONDO A CTA",
+        ]) or u.startswith("PAGO:") or u.startswith("PAGO "):
             return "PURCHASE"
 
         return "UNKNOWN"
-
-    def _clean_text(self, value: str) -> str:
-        return " ".join(str(value).split())
