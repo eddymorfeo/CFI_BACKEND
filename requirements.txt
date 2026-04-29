@@ -8,3 +8,5 @@ python-multipart==0.0.9
 alembic==1.13.2
 pandas
 pdfplumber
+pytest
+pytest-cov

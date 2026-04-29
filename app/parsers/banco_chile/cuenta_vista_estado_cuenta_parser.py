@@ -827,6 +827,9 @@ class BancoChileCuentaVistaEstadoCuentaParser(BaseParser):
         if "ABONO SEGUN INSTRUC." in description_upper:
             return "TRANSFER_IN"
 
+        if "PAGO:PROVEEDORES" in description_upper or "PAGO PROVEEDORES" in description_upper:
+            return "TRANSFER_IN"
+
         if "DEVOLUCION:" in description_upper:
             return "REFUND"
 

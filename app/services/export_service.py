@@ -64,8 +64,8 @@ class ExportService:
                     [
                         ExportService._format_date(movement.transaction_date),
                         "",
-                        movement.description or "",
-                        movement.document_number or "",
+                        ExportService._format_text(movement.description),
+                        ExportService._format_text(movement.document_number),
                         ExportService._format_amount(movement.charge_amount),
                         ExportService._format_amount(movement.deposit_amount),
                         "",
@@ -90,3 +90,10 @@ class ExportService:
             return str(normalized_amount)
 
         return str(int(amount))
+
+    @staticmethod
+    def _format_text(value) -> str:
+        if value is None:
+            return ""
+
+        return str(value).strip().upper()

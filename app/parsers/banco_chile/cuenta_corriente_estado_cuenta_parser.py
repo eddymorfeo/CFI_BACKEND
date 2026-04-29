@@ -622,6 +622,8 @@ class BancoChileCuentaCorrienteEstadoCuentaParser(BaseParser):
             return "DEPOSIT"
         if "TRANSFERENCIA DESDE LINEA DE CREDI" in u:
             return "CREDIT_LINE_TRANSFER_IN"
+        if "PAGO:PROVEEDORES" in u or "PAGO PROVEEDORES" in u:
+            return "DEPOSIT"
         if "PAGO:DE SUELDOS" in u or "PAGO DE SUELDOS" in u:
             return "SALARY_PAYMENT"
         if "DEVOLUCION:" in u:

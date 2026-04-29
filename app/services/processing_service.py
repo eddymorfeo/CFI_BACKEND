@@ -69,9 +69,9 @@ class ProcessingService:
                 row_number=movement["row_number"],
                 page_number=movement["page_number"],
                 transaction_date=movement["transaction_date"],
-                branch=movement["branch"],
-                description=movement["description"],
-                document_number=movement["document_number"],
+                branch=ProcessingService._to_uppercase_text(movement["branch"]),
+                description=ProcessingService._to_uppercase_text(movement["description"]),
+                document_number=ProcessingService._to_uppercase_text(movement["document_number"]),
                 charge_amount=movement["charge_amount"],
                 deposit_amount=movement["deposit_amount"],
                 balance_amount=movement["balance_amount"],
@@ -88,9 +88,15 @@ class ProcessingService:
         if hasattr(source_document, "parser_code"):
             source_document.parser_code = parsed_result.get("parser_code")
 
-        source_document.detected_institution_name = document_metadata.get("detected_institution_name")
-        source_document.detected_holder_name = document_metadata.get("detected_holder_name")
-        source_document.detected_account_number = document_metadata.get("detected_account_number")
+        source_document.detected_institution_name = ProcessingService._to_uppercase_text(
+            document_metadata.get("detected_institution_name")
+        )
+        source_document.detected_holder_name = ProcessingService._to_uppercase_text(
+            document_metadata.get("detected_holder_name")
+        )
+        source_document.detected_account_number = ProcessingService._to_uppercase_text(
+            document_metadata.get("detected_account_number")
+        )
         source_document.document_date_from = document_metadata.get("document_date_from")
         source_document.document_date_to = document_metadata.get("document_date_to")
         source_document.processing_status = "PROCESSED"
@@ -104,3 +110,14 @@ class ProcessingService:
             "movements_count": len(parsed_result["movements"]),
             "status": "processed",
         }
+
+    @staticmethod
+    def _to_uppercase_text(value):
+        if value is None:
+            return None
+
+        normalized_value = str(value).strip()
+        if not normalized_value:
+            return ""
+
+        return normalized_value.upper()

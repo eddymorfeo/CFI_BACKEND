@@ -6,6 +6,9 @@ class DocumentClassifierService:
 
         parser_code_upper = parser_code.upper()
 
+        if "CHEQUERA_ELECTRONICA" in parser_code_upper:
+            return "Cartola Bancaria"
+
         if "TRANSFER" in parser_code_upper:
             return "Cartola Transferencias"
 
@@ -20,6 +23,9 @@ class DocumentClassifierService:
             return None
 
         parser_code_upper = parser_code.upper()
+
+        if "CHEQUERA_ELECTRONICA" in parser_code_upper:
+            return "Chequera Electrónica"
 
         if "CARTOLA_HISTORICA" in parser_code_upper:
             return "Cartola Histórica"
