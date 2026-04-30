@@ -21,6 +21,9 @@ class BancoEstadoCartolaInstantaneaParser(BaseParser):
 
         normalized_text = " ".join(first_page_text.split()).upper()
 
+        if "AHORRO:" in normalized_text or "ESTADO DE MOVIMIENTOS AHORRO" in normalized_text:
+            return False
+
         return (
             "CARTOLA INSTANTÁNEA" in normalized_text
             or (

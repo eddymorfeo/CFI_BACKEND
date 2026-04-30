@@ -8,6 +8,10 @@ def test_cada_pdf_de_muestra_tiene_un_unico_parser(pdf_path):
         "CARTOL_1.PDF": "BancoEstadoChequeraElectronicaParser",
         "CV Sandra Sanhueza.pdf": "BancoChileCuentaVistaEstadoCuentaParser",
         "Cuenta Corriente Chile OK.pdf": "BancoChileCuentaCorrienteEstadoCuentaParser",
+        "000-77-35262-7.pdf": "BancoSantanderCuentaCorrienteFanParser",
+        "CARTOLAS 5613913990.pdf": "BancoSantanderCuentaMasLucasParser",
+        "Cartola  cta 49888609 BCI.pdf": "BancoBciCuentaCorrienteParser",
+        "CARTOL~1 1.PDF": "BancoEstadoCartolaInstantaneaAhorroParser",
         "TOF-25000068 Andrea Sanhueza Álvarez cta cte OK.pdf": "BancoChileCuentaCorrienteEstadoCuentaParser",
     }
 

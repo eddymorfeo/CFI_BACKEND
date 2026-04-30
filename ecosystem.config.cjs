@@ -3,34 +3,32 @@ module.exports = {
     {
       name: "cfi-backend-prod",
       cwd: "C:/Users/etejeda/Desktop/Proyectos/CFI/CFI_BACKEND",
-      script: "C:/Users/etejeda/Desktop/Proyectos/CFI/CFI_BACKEND/venv/Scripts/python.exe",
-      args: [
-        "-m",
-        "uvicorn",
-        "app.main:app",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8000",
-      ],
-      interpreter: "none",
+
+      script: "C:/Users/etejeda/Desktop/Proyectos/CFI/CFI_BACKEND/venv/Scripts/pythonw.exe",
+      args: "-m uvicorn app.main:app --host 0.0.0.0 --port 8000",
+
       exec_mode: "fork",
       instances: 1,
       autorestart: true,
       watch: false,
-      max_restarts: 10,
-      min_uptime: "5s",
-      restart_delay: 2000,
+      max_restarts: 5,
+      restart_delay: 5000,
       windowsHide: true,
-      out_file: "C:/Users/etejeda/Desktop/Proyectos/CFI/CFI_BACKEND/logs/pm2-backend-out.log",
-      error_file: "C:/Users/etejeda/Desktop/Proyectos/CFI/CFI_BACKEND/logs/pm2-backend-error.log",
+
+      out_file: "C:/Users/etejeda/Desktop/Proyectos/CFI/CFI_BACKEND/logs/backend-out.log",
+      error_file: "C:/Users/etejeda/Desktop/Proyectos/CFI/CFI_BACKEND/logs/backend-error.log",
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+
       env: {
         APP_ENV: "production",
-      },
+        APP_HOST: "0.0.0.0",
+        APP_PORT: "8000"
+      }
     },
     {
       name: "cfi-frontend-prod",
       cwd: "C:/Users/etejeda/Desktop/Proyectos/CFI/CFI_FRONTEND",
+
       script: "C:/Program Files/nodejs/node.exe",
       args: [
         "node_modules/vite/bin/vite.js",
@@ -39,22 +37,24 @@ module.exports = {
         "0.0.0.0",
         "--port",
         "5173",
-        "--strictPort",
+        "--strictPort"
       ],
-      interpreter: "none",
+
       exec_mode: "fork",
       instances: 1,
       autorestart: true,
       watch: false,
-      max_restarts: 10,
-      min_uptime: "5s",
-      restart_delay: 2000,
+      max_restarts: 5,
+      restart_delay: 5000,
       windowsHide: true,
-      out_file: "C:/Users/etejeda/Desktop/Proyectos/CFI/CFI_BACKEND/logs/pm2-frontend-out.log",
-      error_file: "C:/Users/etejeda/Desktop/Proyectos/CFI/CFI_BACKEND/logs/pm2-frontend-error.log",
+
+      out_file: "C:/Users/etejeda/Desktop/Proyectos/CFI/CFI_BACKEND/logs/frontend-out.log",
+      error_file: "C:/Users/etejeda/Desktop/Proyectos/CFI/CFI_BACKEND/logs/frontend-error.log",
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+
       env: {
-        NODE_ENV: "production",
-      },
-    },
-  ],
+        NODE_ENV: "production"
+      }
+    }
+  ]
 };
