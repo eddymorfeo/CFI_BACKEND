@@ -1,3 +1,4 @@
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,13 +11,26 @@ from app.core.errors import AppException
 from app.models.extracted_movement import ExtractedMovement
 from app.models.source_document import SourceDocument
 from app.services.document_classifier_service import DocumentClassifierService
-from app.utils.file_utils import save_upload_file
+from app.utils.file_utils import save_upload_content
 
 
 class DocumentService:
     @staticmethod
     async def upload_document(database: Session, upload_file: UploadFile) -> SourceDocument:
-        file_path, stored_file_name, file_size_bytes, file_hash_sha256 = await save_upload_file(upload_file)
+        content = await upload_file.read()
+        file_hash_sha256 = hashlib.sha256(content).hexdigest()
+        existing_document = DocumentService._get_document_by_hash(database, file_hash_sha256)
+
+        if existing_document is not None:
+            raise DocumentService._build_duplicate_document_exception(
+                upload_file_name=upload_file.filename,
+                existing_document=existing_document,
+            )
+
+        file_path, stored_file_name, file_size_bytes, file_hash_sha256 = save_upload_content(
+            original_file_name=upload_file.filename,
+            content=content,
+        )
 
         source_document = SourceDocument(
             original_file_name=upload_file.filename,
@@ -38,6 +52,15 @@ class DocumentService:
             database.refresh(source_document)
         except IntegrityError:
             database.rollback()
+            Path(file_path).unlink(missing_ok=True)
+            existing_document = DocumentService._get_document_by_hash(database, file_hash_sha256)
+
+            if existing_document is not None:
+                raise DocumentService._build_duplicate_document_exception(
+                    upload_file_name=upload_file.filename,
+                    existing_document=existing_document,
+                )
+
             raise AppException(
                 error_code="DOCUMENT_ALREADY_EXISTS",
                 message="Este archivo ya fue cargado anteriormente.",
@@ -190,3 +213,36 @@ class DocumentService:
             source_document_id: movements_count
             for source_document_id, movements_count in rows
         }
+
+    @staticmethod
+    def _get_document_by_hash(database: Session, file_hash_sha256: str) -> SourceDocument | None:
+        return (
+            database.query(SourceDocument)
+            .filter(SourceDocument.file_hash_sha256 == file_hash_sha256)
+            .first()
+        )
+
+    @staticmethod
+    def _build_duplicate_document_exception(
+        upload_file_name: str,
+        existing_document: SourceDocument,
+    ) -> AppException:
+        detail = (
+            f"Este PDF ya fue cargado anteriormente como "
+            f"'{existing_document.original_file_name}'."
+        )
+
+        return AppException(
+            error_code="DOCUMENT_ALREADY_EXISTS",
+            message="Este documento ya existe por contenido.",
+            detail=detail,
+            status_code=status.HTTP_409_CONFLICT,
+            context={
+                "original_file_name": upload_file_name,
+                "existing_source_document_id": str(existing_document.source_document_id),
+                "existing_original_file_name": existing_document.original_file_name,
+                "existing_uploaded_at": existing_document.uploaded_at.isoformat()
+                if existing_document.uploaded_at is not None
+                else None,
+            },
+        )

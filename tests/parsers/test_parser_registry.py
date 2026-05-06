@@ -4,6 +4,8 @@ from app.parsers.parser_registry import get_available_parsers
 def test_cada_pdf_de_muestra_tiene_un_unico_parser(pdf_path):
     expected_parsers = {
         "BE_CartolaMambuPDF OK.pdf": "BancoEstadoCartolaHistoricaParser",
+        "1.pdf": "BancoEstadoChequeraElectronicaParser",
+        "CARTOLA CTA CTE.pdf": "BancoEstadoCuentaCorrienteParser",
         "CARTOLA HISTORICA 1 OK.pdf": "BancoEstadoCartolaInstantaneaParser",
         "CARTOL_1.PDF": "BancoEstadoChequeraElectronicaParser",
         "CV Sandra Sanhueza.pdf": "BancoChileCuentaVistaEstadoCuentaParser",

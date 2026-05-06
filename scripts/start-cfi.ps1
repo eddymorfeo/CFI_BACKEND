@@ -35,6 +35,8 @@ if ($BuildFrontend) {
 
 $BackendCommand = @"
 Set-Location '$BackendPath'
+`$env:APP_ENV = 'production'
+`$env:POSTGRES_DB = 'CFI'
 .\venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000 *> '$LogsPath\backend.log'
 "@
 

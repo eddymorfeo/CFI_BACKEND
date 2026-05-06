@@ -8,9 +8,9 @@ import pdfplumber
 from app.parsers.base_parser import BaseParser
 
 
-class BancoEstadoChequeraElectronicaParser(BaseParser):
+class BancoEstadoCuentaCorrienteParser(BaseParser):
     ROW_PATTERN = re.compile(
-        r"^(?:(?P<document_number>\d{7})\s+)?"
+        r"^(?P<document_number>\d{7})\s+"
         r"(?P<description>.+?)\s+"
         r"(?P<branch>\d{3})\s+"
         r"(?P<amount>-?\d{1,3}(?:\.\d{3})*|-?\d+)\s+"
@@ -31,9 +31,10 @@ class BancoEstadoChequeraElectronicaParser(BaseParser):
 
         return (
             "CARTOLA HISTORICA" in normalized_text
-            and "CHEQUERA ELECTRONICA" in normalized_text
-            and "CUENTA VISTA" in normalized_text
+            and "CUENTA CORRIENTE" in normalized_text
+            and "NOMBRE DESDE HASTA" in normalized_text
             and "SALDO ANTERIOR" in normalized_text
+            and "N DOCTO" in normalized_text
         )
 
     def parse(self, file_path: str) -> dict:
@@ -53,14 +54,10 @@ class BancoEstadoChequeraElectronicaParser(BaseParser):
         movements = self._extract_movements(pages, page_metadata)
 
         return {
-            "parser_code": "BANCO_ESTADO_CHEQUERA_ELECTRONICA",
+            "parser_code": "BANCO_ESTADO_CUENTA_CORRIENTE_CARTOLA_HISTORICA",
             "document_metadata": document_metadata,
             "movements": movements,
         }
-
-    def _extract_metadata(self, pages: list[dict]) -> dict:
-        page_metadata = [self._extract_page_metadata(page["text"]) for page in pages]
-        return self._build_document_metadata(page_metadata)
 
     def _extract_page_metadata(self, page_text: str) -> dict:
         compact_text = self._clean_text(page_text)
@@ -82,7 +79,7 @@ class BancoEstadoChequeraElectronicaParser(BaseParser):
             document_date_to = self._parse_date(holder_period_match.group(3), "%d/%m/%Y")
 
         account_match = re.search(
-            r"CUENTA\s+VISTA\s+OFICINA\s+MONEDA\s+([0-9-]+)\s+",
+            r"CUENTA\s+CORRIENTE\s+OFICINA\s+MONEDA\s+([0-9-]+)\s+",
             compact_text,
             re.IGNORECASE,
         )
@@ -90,7 +87,7 @@ class BancoEstadoChequeraElectronicaParser(BaseParser):
             account_number = account_match.group(1)
 
         previous_balance_match = re.search(
-            r"SALDO\s+ANTERIOR\s+(\d{1,3}(?:\.\d{3})*|\d+)",
+            r"SALDO\s+ANTERIOR\s+(-?\d{1,3}(?:\.\d{3})*|-?\d+)",
             compact_text,
             re.IGNORECASE,
         )
@@ -98,10 +95,8 @@ class BancoEstadoChequeraElectronicaParser(BaseParser):
             previous_balance = self._parse_amount(previous_balance_match.group(1))
 
         return {
-            "detected_institution_name": "BancoEstado",
             "detected_holder_name": holder_name,
             "detected_account_number": account_number,
-            "detected_account_type": "CHEQUERA ELECTRONICA",
             "document_date_from": document_date_from,
             "document_date_to": document_date_to,
             "previous_balance": previous_balance,
@@ -118,16 +113,16 @@ class BancoEstadoChequeraElectronicaParser(BaseParser):
             for metadata in page_metadata
             if metadata.get("document_date_to") is not None
         ]
+
         first_metadata = page_metadata[0] if page_metadata else {}
 
         return {
             "detected_institution_name": "BancoEstado",
             "detected_holder_name": first_metadata.get("detected_holder_name"),
             "detected_account_number": first_metadata.get("detected_account_number"),
-            "detected_account_type": "CHEQUERA ELECTRONICA",
+            "detected_account_type": "CUENTA CORRIENTE",
             "document_date_from": min(date_from_values) if date_from_values else None,
             "document_date_to": max(date_to_values) if date_to_values else None,
-            "previous_balance": first_metadata.get("previous_balance", Decimal("0")),
         }
 
     def _extract_movements(self, pages: list[dict], page_metadata: list[dict]) -> list[dict]:
@@ -180,7 +175,7 @@ class BancoEstadoChequeraElectronicaParser(BaseParser):
         date_to,
     ) -> dict | None:
         row_match = self.ROW_PATTERN.match(line)
-        if not row_match:
+        if row_match is None:
             return None
 
         document_number = row_match.group("document_number")
@@ -195,7 +190,6 @@ class BancoEstadoChequeraElectronicaParser(BaseParser):
             balance_amount=balance_amount,
             description=description,
         )
-
         detected_movement_type = self._detect_movement_type(description)
 
         return {
@@ -213,7 +207,7 @@ class BancoEstadoChequeraElectronicaParser(BaseParser):
                 "page_number": page_number,
                 "previous_balance": str(previous_balance),
                 "movement_amount": str(movement_amount),
-                "source_format": "BANCO_ESTADO_CHEQUERA_ELECTRONICA",
+                "source_format": "BANCO_ESTADO_CUENTA_CORRIENTE",
             },
             "detected_movement_type": detected_movement_type,
             "is_transfer_candidate": detected_movement_type in {"TRANSFER_IN", "TRANSFER_OUT"},
@@ -258,21 +252,25 @@ class BancoEstadoChequeraElectronicaParser(BaseParser):
         if (
             "TEF BANCOESTADO A " in description_upper
             or description_upper.startswith("TEF A ")
-            or description_upper.startswith("TRANSF A ")
+            or description_upper.startswith("TRANSFERENCIA A ")
         ):
             return "TRANSFER_OUT"
 
-        if "TEF BANCOESTADO DE " in description_upper or description_upper.startswith("TEF DE "):
+        if (
+            "TEF BANCOESTADO DE " in description_upper
+            or description_upper.startswith("TEF DE ")
+            or description_upper.startswith("TRANSFERENCIA DE ")
+        ):
             return "TRANSFER_IN"
+
+        if "COMISION" in description_upper:
+            return "COMMISSION"
 
         if "COMPRA" in description_upper or "PAGO " in description_upper:
             return "PURCHASE"
 
-        if "GIRO" in description_upper:
-            return "WITHDRAWAL"
-
-        if "BONO " in description_upper or description_upper.startswith("BCO "):
-            return "DEPOSIT"
+        if "TRASPASO DEUDA" in description_upper:
+            return "PAYMENT"
 
         return "UNKNOWN"
 
@@ -298,4 +296,4 @@ class BancoEstadoChequeraElectronicaParser(BaseParser):
             character for character in decomposed_value
             if unicodedata.category(character) != "Mn"
         )
-        return self._clean_text(without_accents).upper().replace("N°", "N")
+        return self._clean_text(without_accents).upper().replace("NÂ°", "N").replace("N°", "N")

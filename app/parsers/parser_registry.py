@@ -4,6 +4,7 @@ from app.parsers.banco_estado.cartola_instantanea_parser import BancoEstadoCarto
 from app.parsers.banco_estado.cartola_instantanea_ahorro_parser import (
     BancoEstadoCartolaInstantaneaAhorroParser,
 )
+from app.parsers.banco_estado.cuenta_corriente_parser import BancoEstadoCuentaCorrienteParser
 from app.parsers.banco_chile.cuenta_vista_estado_cuenta_parser import (
     BancoChileCuentaVistaEstadoCuentaParser,
 )
@@ -26,6 +27,7 @@ def get_available_parsers():
     return [
         BancoEstadoChequeraElectronicaParser(),
         BancoEstadoCartolaHistoricaParser(),
+        BancoEstadoCuentaCorrienteParser(),
         BancoEstadoCartolaInstantaneaAhorroParser(),
         BancoEstadoCartolaInstantaneaParser(),
         BancoChileCuentaVistaEstadoCuentaParser(),

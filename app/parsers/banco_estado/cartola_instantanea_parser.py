@@ -1,4 +1,5 @@
 import re
+import unicodedata
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
@@ -9,6 +10,15 @@ from app.parsers.base_parser import BaseParser
 
 class BancoEstadoCartolaInstantaneaParser(BaseParser):
     DATE_PATTERN = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+    DATE_PREFIX_PATTERN = re.compile(r"^\d{2}/\d{2}/\d{4}\b")
+    MOVEMENT_ROW_PATTERN = re.compile(
+        r"^(?P<date>\d{2}/\d{2}/\d{4})\s+"
+        r"(?:(?P<branch>[A-ZÁÉÍÓÚÑ.]+)\s+)?"
+        r"(?P<document_number>\d{6,})\s*"
+        r"(?P<description>.*?)\s+"
+        r"\$\s*(?P<amount>-?\d{1,3}(?:\.\d{3})*|-?\d+)\s+"
+        r"\$\s*(?P<balance>-?\d{1,3}(?:\.\d{3})*|-?\d+)$"
+    )
 
     def can_parse(self, file_path: str) -> bool:
         path = self.validate_file_exists(file_path)
@@ -203,38 +213,188 @@ class BancoEstadoCartolaInstantaneaParser(BaseParser):
     def _extract_movements(self, pages: list[dict]) -> list[dict]:
         movements = []
         row_number = 1
+        movement_lines = self._extract_movement_lines(pages)
+        movement_groups = self._group_table_movement_lines(movement_lines)
+
+        for movement_group in movement_groups:
+            movement = self._parse_table_movement_group(
+                movement_group=movement_group,
+                row_number=row_number,
+            )
+            if movement:
+                movements.append(movement)
+                row_number += 1
+
+        return movements
+
+    def _extract_movement_lines(self, pages: list[dict]) -> list[dict]:
+        movement_lines = []
+        in_movements = False
 
         for page_info in pages:
-            page_number = page_info["page_number"]
-            text = page_info["text"]
+            for raw_line in page_info["text"].split("\n"):
+                line = self._clean_text(raw_line)
+                normalized_line = self._normalize_for_detection(line)
 
-            lines = text.split('\n')
-            lines = [line.strip() for line in lines if line.strip()]
+                if not line:
+                    continue
 
-            movement_lines = []
-            in_movements = False
-
-            for line in lines:
-                if 'Movimientos' in line:
+                if normalized_line == "MOVIMIENTOS":
                     in_movements = True
                     continue
 
-                if in_movements:
-                    if 'Saldos' in line or 'SALDOS' in line or 'retenciones' in line:
-                        break
-                    if 'Página' in line or 'WWW.CMFCHILE.CL' in line.upper() or 'GARANTIA ESTATAL' in line.upper():
-                        continue
-                    movement_lines.append(line)
+                if (
+                    "FECHA SUCURSAL" in normalized_line
+                    and "OPERACION" in normalized_line
+                    and "SALDO" in normalized_line
+                ):
+                    in_movements = True
+                    continue
 
-            movements_data = self._group_movement_lines_advanced(movement_lines)
+                if not in_movements:
+                    continue
 
-            for movement_data in movements_data:
-                movement = self._parse_movement_advanced(movement_data, row_number, page_number)
-                if movement:
-                    movements.append(movement)
-                    row_number += 1
+                if self._is_table_end_line(normalized_line):
+                    continue
 
-        return movements
+                if self._is_ignored_table_line(normalized_line):
+                    continue
+
+                movement_lines.append(
+                    {
+                        "page_number": page_info["page_number"],
+                        "text": line,
+                    }
+                )
+
+        return movement_lines
+
+    def _group_table_movement_lines(self, movement_lines: list[dict]) -> list[dict]:
+        groups = []
+        index = 0
+
+        while index < len(movement_lines):
+            current_line = movement_lines[index]["text"]
+
+            if current_line.startswith("STGO."):
+                if index + 1 < len(movement_lines) and self.DATE_PREFIX_PATTERN.match(
+                    movement_lines[index + 1]["text"]
+                ):
+                    suffix_lines = []
+                    next_index = index + 2
+
+                    while (
+                        next_index < len(movement_lines)
+                        and self._is_branch_continuation_line(movement_lines[next_index]["text"])
+                    ):
+                        suffix_lines.append(movement_lines[next_index])
+                        next_index += 1
+
+                    groups.append(
+                        {
+                            "prefix_line": movement_lines[index],
+                            "date_line": movement_lines[index + 1],
+                            "suffix_lines": suffix_lines,
+                        }
+                    )
+                    index = next_index
+                    continue
+
+            if self.DATE_PREFIX_PATTERN.match(current_line):
+                suffix_lines = []
+                next_index = index + 1
+
+                while (
+                    next_index < len(movement_lines)
+                    and self._is_branch_continuation_line(movement_lines[next_index]["text"])
+                ):
+                    suffix_lines.append(movement_lines[next_index])
+                    next_index += 1
+
+                groups.append(
+                    {
+                        "prefix_line": None,
+                        "date_line": movement_lines[index],
+                        "suffix_lines": suffix_lines,
+                    }
+                )
+                index = next_index
+                continue
+
+            index += 1
+
+        return groups
+
+    def _parse_table_movement_group(self, movement_group: dict, row_number: int) -> dict | None:
+        date_line = movement_group["date_line"]
+        row_match = self.MOVEMENT_ROW_PATTERN.match(date_line["text"])
+
+        if row_match is None:
+            return None
+
+        prefix_line = movement_group.get("prefix_line")
+        suffix_lines = movement_group.get("suffix_lines", [])
+        description_parts = []
+
+        if prefix_line is not None:
+            prefix_description = re.sub(
+                r"^STGO\.\s*",
+                "",
+                prefix_line["text"],
+                flags=re.IGNORECASE,
+            ).strip()
+            if prefix_description:
+                description_parts.append(prefix_description)
+
+        inline_description = self._clean_text(row_match.group("description"))
+        if inline_description:
+            description_parts.append(inline_description)
+
+        suffix_branch = None
+        for suffix_line in suffix_lines:
+            suffix_words = suffix_line["text"].split(maxsplit=1)
+            if not suffix_words:
+                continue
+            if suffix_branch is None:
+                suffix_branch = suffix_words[0]
+            if len(suffix_words) > 1:
+                description_parts.append(suffix_words[1])
+
+        amount = self._parse_signed_amount(row_match.group("amount"))
+        saldo = self._parse_signed_amount(row_match.group("balance"))
+        branch_token = row_match.group("branch") or suffix_branch or "PRINCIPAL"
+        sucursal = self._clean_text(f"STGO. {branch_token}")
+
+        return self._build_result(
+            fecha=row_match.group("date"),
+            documento=row_match.group("document_number"),
+            descripcion=self._clean_description(" ".join(description_parts)),
+            cargo=abs(amount) if amount < 0 else Decimal("0"),
+            abono=amount if amount > 0 else Decimal("0"),
+            saldo=saldo,
+            row_number=row_number,
+            page_number=date_line["page_number"],
+            sucursal=sucursal,
+        )
+
+    def _is_branch_continuation_line(self, line: str) -> bool:
+        normalized_line = self._normalize_for_detection(line)
+        return normalized_line.startswith("PRINCIPAL") or normalized_line.startswith("ESTACION")
+
+    def _is_ignored_table_line(self, normalized_line: str) -> bool:
+        return (
+            normalized_line == "MOVIMIENTO"
+            or normalized_line.startswith("FECHA SUCURSAL")
+            or normalized_line.startswith("INFORMESE SOBRE LA GARANTIA")
+            or normalized_line.startswith("PAGINA")
+        )
+
+    def _is_table_end_line(self, normalized_line: str) -> bool:
+        return (
+            normalized_line.startswith("SALDOS")
+            or normalized_line.startswith("INFORMACION REFERENCIAL")
+            or normalized_line.startswith("RETENCIONES")
+        )
 
     def _group_movement_lines_advanced(self, lines: list[str]) -> list[dict]:
         movements = []
@@ -421,9 +581,9 @@ class BancoEstadoCartolaInstantaneaParser(BaseParser):
         abono: Decimal,
         saldo: Decimal,
         row_number: int,
-        page_number: int
+        page_number: int,
+        sucursal: str = "STGO. PRINCIPAL",
     ) -> dict:
-        sucursal = 'STGO. PRINCIPAL'
         detected_movement_type = self._detect_movement_type(descripcion)
         is_transfer_candidate = detected_movement_type in {"TRANSFER_IN", "TRANSFER_OUT"}
 
@@ -470,7 +630,7 @@ class BancoEstadoCartolaInstantaneaParser(BaseParser):
         return description.strip()
 
     def _detect_movement_type(self, description: str) -> str:
-        desc_upper = description.upper()
+        desc_upper = self._normalize_for_detection(description)
 
         if 'TEF A' in desc_upper or 'TRANSFERENCIA A' in desc_upper:
             return 'TRANSFER_OUT'
@@ -481,7 +641,31 @@ class BancoEstadoCartolaInstantaneaParser(BaseParser):
         if 'COMISION' in desc_upper:
             return 'COMMISSION'
 
+        if 'COMPRA' in desc_upper or 'PAGO' in desc_upper:
+            return 'PURCHASE'
+
+        if 'GIRO' in desc_upper:
+            return 'WITHDRAWAL'
+
         return 'UNKNOWN'
+
+    def _parse_signed_amount(self, raw_amount: str | None) -> Decimal:
+        if raw_amount is None:
+            return Decimal("0")
+
+        normalized_amount = str(raw_amount).replace(".", "").replace(" ", "").strip()
+        if normalized_amount in {"", "-"}:
+            return Decimal("0")
+
+        return Decimal(normalized_amount)
 
     def _clean_text(self, value: str) -> str:
         return ' '.join(str(value).split())
+
+    def _normalize_for_detection(self, value: str) -> str:
+        decomposed_value = unicodedata.normalize("NFD", str(value))
+        without_accents = "".join(
+            character for character in decomposed_value
+            if unicodedata.category(character) != "Mn"
+        )
+        return self._clean_text(without_accents).upper().replace("NÂ°", "N").replace("N°", "N")

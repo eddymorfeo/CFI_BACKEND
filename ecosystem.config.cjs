@@ -22,16 +22,16 @@ module.exports = {
       env: {
         APP_ENV: "production",
         APP_HOST: "0.0.0.0",
-        APP_PORT: "8000"
+        APP_PORT: "8000",
+        POSTGRES_DB: "CFI"
       }
     },
     {
       name: "cfi-frontend-prod",
       cwd: "C:/Users/etejeda/Desktop/Proyectos/CFI/CFI_FRONTEND",
 
-      script: "C:/Program Files/nodejs/node.exe",
+      script: "C:/Users/etejeda/Desktop/Proyectos/CFI/CFI_FRONTEND/node_modules/vite/bin/vite.js",
       args: [
-        "node_modules/vite/bin/vite.js",
         "preview",
         "--host",
         "0.0.0.0",
@@ -41,6 +41,7 @@ module.exports = {
       ],
 
       exec_mode: "fork",
+      interpreter: "C:/Program Files/nodejs/node.exe",
       instances: 1,
       autorestart: true,
       watch: false,

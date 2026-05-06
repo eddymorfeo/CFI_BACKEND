@@ -18,12 +18,10 @@ def build_stored_file_name(original_file_name: str) -> str:
     return f"{uuid.uuid4()}{file_extension}"
 
 
-async def save_upload_file(upload_file: UploadFile) -> tuple[str, str, int, str]:
+def save_upload_content(original_file_name: str, content: bytes) -> tuple[str, str, int, str]:
     upload_directory = ensure_upload_directory_exists()
-    stored_file_name = build_stored_file_name(upload_file.filename)
+    stored_file_name = build_stored_file_name(original_file_name)
     file_path = upload_directory / stored_file_name
-
-    content = await upload_file.read()
 
     with open(file_path, "wb") as output_file:
         output_file.write(content)
@@ -32,3 +30,8 @@ async def save_upload_file(upload_file: UploadFile) -> tuple[str, str, int, str]
     file_size_bytes = len(content)
 
     return str(file_path), stored_file_name, file_size_bytes, file_hash_sha256
+
+
+async def save_upload_file(upload_file: UploadFile) -> tuple[str, str, int, str]:
+    content = await upload_file.read()
+    return save_upload_content(upload_file.filename, content)
