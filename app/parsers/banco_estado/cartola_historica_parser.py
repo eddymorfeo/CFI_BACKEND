@@ -9,7 +9,13 @@ from app.parsers.base_parser import BaseParser
 
 class BancoEstadoCartolaHistoricaParser(BaseParser):
     DATE_PATTERN = re.compile(r"^\d{2}/\d{2}/\d{4}$")
-    DOC_PATTERN = re.compile(r"^\d{6,}$")
+    DOCUMENT_COLUMN_MAX_X = 115
+    DESCRIPTION_COLUMN_MIN_X = 110
+    CHARGE_COLUMN_MIN_X = 300
+    CHARGE_COLUMN_MAX_X = 390
+    DEPOSIT_COLUMN_MIN_X = 390
+    DEPOSIT_COLUMN_MAX_X = 450
+    BALANCE_COLUMN_MIN_X = 530
 
     def can_parse(self, file_path: str) -> bool:
         path = self.validate_file_exists(file_path)
@@ -180,7 +186,6 @@ class BancoEstadoCartolaHistoricaParser(BaseParser):
             if not row_words:
                 continue
 
-            first_token = self._clean_text(row_words[0]["text"])
             row_top = min(float(word["top"]) for word in row_words)
             row_text = self._row_text(row_words).upper()
 
@@ -195,7 +200,7 @@ class BancoEstadoCartolaHistoricaParser(BaseParser):
                 "suffix_rows": [],
             }
 
-            if self.DOC_PATTERN.fullmatch(first_token):
+            if self._is_movement_anchor_row(row_words):
                 anchors.append(row_data)
             elif self._is_description_only_row(row_words):
                 floating_rows.append(row_data)
@@ -236,9 +241,6 @@ class BancoEstadoCartolaHistoricaParser(BaseParser):
         cleaned_texts = [self._clean_text(word["text"]) for word in row_words if self._clean_text(word["text"])]
 
         if not cleaned_texts:
-            return False
-
-        if any(self.DOC_PATTERN.fullmatch(text) for text in cleaned_texts):
             return False
 
         if any(self.DATE_PATTERN.fullmatch(text) for text in cleaned_texts):
@@ -293,12 +295,7 @@ class BancoEstadoCartolaHistoricaParser(BaseParser):
         suffix_rows = logical_row["suffix_rows"]
 
         anchor_words = sorted(anchor_row, key=lambda item: float(item["x0"]))
-        anchor_first_word = self._clean_text(anchor_words[0]["text"])
-
-        if not self.DOC_PATTERN.fullmatch(anchor_first_word):
-            return None
-
-        document_number = anchor_first_word
+        document_number = self._extract_document_number(anchor_words)
 
         prefix_words = [word for row in prefix_rows for word in sorted(row, key=lambda item: float(item["x0"]))]
         suffix_words_flat = [word for row in suffix_rows for word in sorted(row, key=lambda item: float(item["x0"]))]
@@ -315,7 +312,7 @@ class BancoEstadoCartolaHistoricaParser(BaseParser):
             if text and x0 < 300:
                 description_parts.append(text)
 
-        for word in anchor_words[1:]:
+        for word in anchor_words:
             text = self._clean_text(word["text"])
             x0 = float(word["x0"])
 
@@ -326,15 +323,15 @@ class BancoEstadoCartolaHistoricaParser(BaseParser):
                 transaction_date_raw = text
                 continue
 
-            if x0 < 300:
+            if self.DESCRIPTION_COLUMN_MIN_X <= x0 < self.CHARGE_COLUMN_MIN_X:
                 description_parts.append(text)
-            elif 300 <= x0 < 390:
+            elif self.CHARGE_COLUMN_MIN_X <= x0 < self.CHARGE_COLUMN_MAX_X:
                 if self._looks_like_amount(text):
                     charge_tokens.append(text)
-            elif 390 <= x0 < 450:
+            elif self.DEPOSIT_COLUMN_MIN_X <= x0 < self.DEPOSIT_COLUMN_MAX_X:
                 if self._looks_like_amount(text):
                     deposit_tokens.append(text)
-            elif x0 >= 530:
+            elif x0 >= self.BALANCE_COLUMN_MIN_X:
                 if self._looks_like_amount(text):
                     balance_tokens.append(text)
 
@@ -412,6 +409,45 @@ class BancoEstadoCartolaHistoricaParser(BaseParser):
 
     def _looks_like_amount(self, value: str) -> bool:
         return re.fullmatch(r"[0-9\.\-]+", value) is not None
+
+    def _is_movement_anchor_row(self, row_words: list[dict]) -> bool:
+        has_document_value = any(
+            self._clean_text(word["text"])
+            and float(word["x0"]) < self.DOCUMENT_COLUMN_MAX_X
+            for word in row_words
+        )
+        has_date = any(
+            self.DATE_PATTERN.fullmatch(self._clean_text(word["text"]))
+            for word in row_words
+        )
+        has_charge_or_deposit = any(
+            self._looks_like_amount(self._clean_text(word["text"]))
+            and (
+                self.CHARGE_COLUMN_MIN_X <= float(word["x0"]) < self.CHARGE_COLUMN_MAX_X
+                or self.DEPOSIT_COLUMN_MIN_X <= float(word["x0"]) < self.DEPOSIT_COLUMN_MAX_X
+            )
+            for word in row_words
+        )
+        has_balance = any(
+            self._looks_like_amount(self._clean_text(word["text"]))
+            and float(word["x0"]) >= self.BALANCE_COLUMN_MIN_X
+            for word in row_words
+        )
+
+        return has_document_value and has_date and has_charge_or_deposit and has_balance
+
+    def _extract_document_number(self, anchor_words: list[dict]) -> str | None:
+        document_tokens = [
+            self._clean_text(word["text"])
+            for word in anchor_words
+            if self._clean_text(word["text"])
+            and float(word["x0"]) < self.DOCUMENT_COLUMN_MAX_X
+            and self._clean_text(word["text"]) != "$"
+            and not self.DATE_PATTERN.fullmatch(self._clean_text(word["text"]))
+        ]
+
+        document_number = self._clean_text(" ".join(document_tokens))
+        return document_number or None
 
     def _detect_movement_type(self, description: str) -> str:
         description_upper = description.upper()
